@@ -1094,22 +1094,23 @@ unsigned PeeringState::get_backfill_priority()
         }
 
     // 2) Apply bias only if at least one source is pressured and no target is pressured.
-    if (!target_pressured) {
-      bool source_pressured = false;
-      for (const auto& s : stray_set) {
-        if (is_pressured_osd(m, s.osd)) { source_pressured = true; break; }
-      }
-      if (source_pressured) {
-        // Saturating add, still honoring the existing clamp upper bound.
-        const int maxp = max_prio_map[base];
-        if (ret < maxp) {
-          const int64_t widened = static_cast<int64_t>(ret) + boost;
-          ret = static_cast<int>(std::min<int64_t>(widened, maxp));
-        }
-      }
-    }
+      if (!target_pressured) {
+      	bool source_pressured = false;
+      	for (const auto& s : stray_set) {
+          if (is_pressured_osd(m, s.osd)) { source_pressured = true; break; }
+      	}
+      	  if (source_pressured) {
+        	// Saturating add, still honoring the existing clamp upper bound.
+        	const int maxp = max_prio_map[base];
+        	if (ret < maxp) {
+          		const int64_t widened = static_cast<int64_t>(ret) + boost;
+          		ret = static_cast<int>(std::min<int64_t>(widened, maxp));
+        	}
+      	  }
+    	}
+  	  }
+	}		
   }
-}		
   psdout(20) << __func__ << " backfill priority is " << ret << dendl;
   return static_cast<unsigned>(ret);
 }
