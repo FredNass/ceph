@@ -1082,7 +1082,8 @@ unsigned PeeringState::get_backfill_priority()
     }
 
     // Configurable bias: additive, bounded by the existing clamp.
-    const int boost = cct->_conf.get_val<int>("osd_backfill_source_fullness_boost");
+    const int64_t boost = cct->_conf.get_val<int64_t>("osd_backfill_source_fullness_boost");
+  
     if (boost > 0) {
       auto m = get_osdmap();
       if (m) {
@@ -1092,24 +1093,23 @@ unsigned PeeringState::get_backfill_priority()
           if (is_pressured_osd(m, t.osd)) { target_pressured = true; break; }
         }
 
-        // 2) Apply bias only if at least one source is pressured and no target is pressured.
-        if (!target_pressured) {
-          bool source_pressured = false;
-          for (const auto& s : stray_set) {
-            if (is_pressured_osd(m, s.osd)) { source_pressured = true; break; }
-          }
-          if (source_pressured) {
-            // Saturating add, still honoring the existing clamp upper bound.
-            const int maxp = max_prio_map[base];
-            if (ret < maxp) {
-              // Watch for potential integer overflow on very large boost (defensive).
-              const int64_t widened = static_cast<int64_t>(ret) + static_cast<int64_t>(boost);
-              ret = static_cast<int>(std::min<int64_t>(widened, maxp));
-            }
-          }
+    // 2) Apply bias only if at least one source is pressured and no target is pressured.
+    if (!target_pressured) {
+      bool source_pressured = false;
+      for (const auto& s : stray_set) {
+        if (is_pressured_osd(m, s.osd)) { source_pressured = true; break; }
+      }
+      if (source_pressured) {
+        // Saturating add, still honoring the existing clamp upper bound.
+        const int maxp = max_prio_map[base];
+        if (ret < maxp) {
+          const int64_t widened = static_cast<int64_t>(ret) + boost;
+          ret = static_cast<int>(std::min<int64_t>(widened, maxp));
         }
       }
-		
+    }
+  }
+}		
   psdout(20) << __func__ << " backfill priority is " << ret << dendl;
   return static_cast<unsigned>(ret);
 }
