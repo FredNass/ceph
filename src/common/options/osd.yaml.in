@@ -1494,3 +1494,12 @@ options:
   level: dev
   default: true
   with_legacy: true
+- name: osd_backfill_source_fullness_boost
+  type: int
+  level: advanced
+  default: 15
+  min: 0
+  desc: Additive backfill priority boost when any backfill source OSD for a PG is nearfull or backfillfull
+  note: This setting is ignored when value is null
+  flags:
+  - runtime
