@@ -35,6 +35,17 @@ using std::vector;
 using ceph::Formatter;
 using ceph::make_message;
 
+using namespace std;
+
+namespace {
+// Safe, inline helper to check if an OSD is space-pressured for backfill purposes.
+inline bool is_pressured_osd(const OSDMapRef& m, int osd_id) {
+  if (!m || osd_id < 0) return false; // tolerate missing map or invalid id
+  uint32_t st = m->get_state(osd_id);
+  return (st & (CEPH_OSD_BACKFILLFULL | CEPH_OSD_NEARFULL)) != 0;
+}
+} // anonymous namespace
+
 BufferedRecoveryMessages::BufferedRecoveryMessages(PeeringCtx &ctx)
   // steal messages from ctx
   : message_map{std::move(ctx.message_map)}
@@ -1062,7 +1073,43 @@ unsigned PeeringState::get_backfill_priority()
     pool.info.opts.get(pool_opts_t::RECOVERY_PRIORITY, &pool_recovery_priority);
 
     ret = clamp_recovery_priority(ret, pool_recovery_priority, max_prio_map[base]);
-  }
+    
+	// Fast exit if there is nothing to backfill or no sources to drain.
+    // (Avoid extra map lookups and scans when not needed.)
+    if (get_backfill_targets().empty() || stray_set.empty()) {
+      psdout(20) << "backfill priority is " << ret << dendl;
+      return static_cast<unsigned>(std::max(ret, 0));
+    }
+
+    // Configurable bias: additive, bounded by the existing clamp.
+    const int boost = cct->_conf.get_val<int>("osd_backfill_source_fullness_boost");
+    if (boost > 0) {
+      auto m = get_osdmap();
+      if (m) {
+        // 1) Suppress bias if any backfill target is space-pressured.
+        bool target_pressured = false;
+        for (const auto& t : get_backfill_targets()) {
+          if (is_pressured_osd(m, t.osd)) { target_pressured = true; break; }
+        }
+
+        // 2) Apply bias only if at least one source is pressured and no target is pressured.
+        if (!target_pressured) {
+          bool source_pressured = false;
+          for (const auto& s : stray_set) {
+            if (is_pressured_osd(m, s.osd)) { source_pressured = true; break; }
+          }
+          if (source_pressured) {
+            // Saturating add, still honoring the existing clamp upper bound.
+            const int maxp = max_prio_map[base];
+            if (ret < maxp) {
+              // Watch for potential integer overflow on very large boost (defensive).
+              const int64_t widened = static_cast<int64_t>(ret) + static_cast<int64_t>(boost);
+              ret = static_cast<int>(std::min<int64_t>(widened, maxp));
+            }
+          }
+        }
+      }
+    }
 
   psdout(20) << __func__ << " backfill priority is " << ret << dendl;
   return static_cast<unsigned>(ret);
