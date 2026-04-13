@@ -1109,8 +1109,7 @@ unsigned PeeringState::get_backfill_priority()
           }
         }
       }
-    }
-
+		
   psdout(20) << __func__ << " backfill priority is " << ret << dendl;
   return static_cast<unsigned>(ret);
 }
