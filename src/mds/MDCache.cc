@@ -9881,7 +9881,7 @@ void MDCache::request_cleanup(MDRequestRef& mdr)
     if (!new_batch_head) {
       mdr->batch_op_map->erase(it);
     } else {
-      mds->finisher->queue(new C_MDS_RetryRequest(this, new_batch_head));
+      mds->queue_waiter(new C_MDS_RetryRequest(this, new_batch_head));
     }
   }
 
