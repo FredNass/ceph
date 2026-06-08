@@ -1,3 +1,14 @@
+>=18.2.9
+--------
+
+* cephadm: During ``ceph orch upgrade``, CephFS filesystems are now prepared
+  and restored one at a time during the MDS phase, so at most one filesystem
+  is offline (``fail_fs = true``) or degraded (scaled down to ``max_mds 1``)
+  at any moment, instead of all filesystems simultaneously. Total upgrade
+  duration is unchanged, as MDS daemons were already redeployed serially.
+  The previous behaviour can be restored with
+  ``ceph config set mgr mgr/cephadm/upgrade_fs_one_at_a_time false``.
+
 >=18.2.7
 --------
 
