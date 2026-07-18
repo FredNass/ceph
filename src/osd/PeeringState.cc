@@ -1186,6 +1186,30 @@ unsigned PeeringState::get_recovery_priority()
   return static_cast<unsigned>(ret);
 }
 
+bool PeeringState::backfill_source_fullness_boost_applies(
+  const OSDMapRef &osdmap) const
+{
+  // OSDs that hold a copy of this PG but are due to be drained once
+  // backfilling completes: outgoing members of the acting set (acting
+  // minus up) and stray peers. Their copies are only removed once the
+  // PG goes clean, so completing this backfill frees space on them.
+  auto is_backfillfull = [&osdmap](int osd) {
+    return osdmap->exists(osd) &&
+      (osdmap->get_state(osd) & CEPH_OSD_BACKFILLFULL);
+  };
+  for (const auto &p : actingset) {
+    if (!upset.count(p) && is_backfillfull(p.osd)) {
+      return true;
+    }
+  }
+  for (const auto &p : stray_set) {
+    if (is_backfillfull(p.osd)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 unsigned PeeringState::get_backfill_priority()
 {
   // a higher value -> a higher priority
@@ -1216,6 +1240,16 @@ unsigned PeeringState::get_backfill_priority()
     pool.info.opts.get(pool_opts_t::RECOVERY_PRIORITY, &pool_recovery_priority);
 
     ret = clamp_recovery_priority(ret, pool_recovery_priority, get_max_prio_for_base(base));
+
+    // Prefer backfills that will free space on backfillfull OSDs: outgoing
+    // and stray copies of this PG can only be removed once backfilling
+    // completes and the PG goes clean.
+    int64_t boost =
+      cct->_conf.get_val<int64_t>("osd_backfill_source_fullness_boost");
+    if (boost > 0 && backfill_source_fullness_boost_applies(get_osdmap())) {
+      ret = std::min(ret + static_cast<int>(boost),
+                     get_max_prio_for_base(base));
+    }
   }
 
   psdout(20) << "backfill priority is " << ret << dendl;
@@ -6713,6 +6747,21 @@ boost::statechart::result PeeringState::Active::react(const AdvMap& advmap)
       ps->state_set(PG_STATE_UNDERSIZED);
     }
     // degraded changes will be detected by call from publish_stats_to_osd()
+  }
+
+  /* If an OSD that will be drained by this PG's backfill crossed the
+   * backfillfull threshold (in either direction), update the local backfill
+   * reservation priority in place so that queued reservations are
+   * reordered accordingly. */
+  if ((ps->state_test(PG_STATE_BACKFILL_WAIT) ||
+       ps->state_test(PG_STATE_BACKFILLING)) &&
+      ps->cct->_conf.get_val<int64_t>(
+        "osd_backfill_source_fullness_boost") > 0 &&
+      ps->backfill_source_fullness_boost_applies(advmap.lastmap) !=
+      ps->backfill_source_fullness_boost_applies(advmap.osdmap)) {
+    psdout(10) << "backfill source fullness changed, updating backfill priority"
+               << dendl;
+    pl->update_local_background_io_priority(ps->get_backfill_priority());
   }
 
   pl->publish_stats_to_osd();
