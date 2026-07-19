@@ -390,6 +390,24 @@ private:
   void maybe_prime_pg_temp();
   void prime_pg_temp(const OSDMap& next, pg_t pgid);
 
+  ceph::mutex pin_remapped_lock =
+    ceph::make_mutex("OSDMonitor::pin_remapped_lock");
+  struct PinRemappedJob : public ParallelPGMapper::Job {
+    OSDMonitor *osdmon;
+    PinRemappedJob(const OSDMap& om, OSDMonitor *m)
+      : ParallelPGMapper::Job(&om), osdmon(m) {}
+    void process(int64_t pool, unsigned ps_begin, unsigned ps_end) override {
+      for (unsigned ps = ps_begin; ps < ps_end; ++ps) {
+        pg_t pgid(ps, pool);
+        osdmon->pin_remapped_pg(*osdmap, pgid);
+      }
+    }
+    void process(const std::vector<pg_t>& pgs) override {}
+    void complete() override {}
+  };
+  void maybe_pin_remapped_pgs();
+  void pin_remapped_pg(const OSDMap& next, pg_t pgid);
+
   ParallelPGMapper mapper;                        ///< for background pg work
   OSDMapMapping mapping;                          ///< pg <-> osd mappings
   std::unique_ptr<ParallelPGMapper::Job> mapping_job;  ///< background mapping job

@@ -1026,6 +1026,11 @@ COMMAND("osd rm-pg-upmap-items "
 	"name=pgid,type=CephPgid",
 	"clear pg_upmap_items mapping for <pgid> (developers only)",
         "osd", "rw")
+COMMAND("osd pin-remapped-pgs",
+	"pin all remapped PGs to their current acting set using pg_upmap_items "
+	"entries so that they become active+clean without data movement; "
+	"the balancer in upmap mode will then move data progressively",
+        "osd", "rw")
 COMMAND("osd pg-upmap-primary "
 	"name=pgid,type=CephPgid "
 	"name=id,type=CephOsdName ",
