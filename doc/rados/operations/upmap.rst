@@ -115,3 +115,64 @@ distribution of PGs for each set of pools.
 To see some (gory) details about what the tool is doing, you can pass
 ``--debug-osd 10`` to ``osdmaptool``. To see even more details, pass
 ``--debug-crush 10`` to ``osdmaptool``.
+
+.. _upmap_progressive_data_movement:
+
+Progressive Data Movement
+=========================
+
+By default, any change that alters CRUSH placement -- adding OSDs or hosts,
+draining OSDs by reducing their CRUSH weights, changing a pool's CRUSH rule,
+or increasing a pool's ``pgp_num`` -- immediately remaps the affected PGs and
+starts backfill. On large clusters, this can put a significant fraction of
+the data into a ``remapped``/``misplaced`` state at once, and the resulting
+backfill can take days while degrading client performance.
+
+Setting ``mon_osd_prefer_progressive_data_movement`` to ``true`` changes this
+behavior: whenever such a change would remap PGs, the monitor creates
+``pg_upmap_items`` entries *in the same OSDMap epoch* that pin the affected
+PGs to their current (clean) placement. PGs therefore stay ``active+clean``
+and no immediate data movement occurs. The :ref:`balancer <balancer>` in
+``upmap`` mode then gradually removes these entries, moving data toward its
+intended placement at the pace bounded by ``target_max_misplaced_ratio``
+(and, because PGs are clean rather than remapped, this happens within the
+balancer's normal schedule). This is the native, atomic equivalent of the
+``upmap-remapped.py`` and ``pgremapper`` community tools:
+
+.. prompt:: bash $
+
+   ceph config set mon mon_osd_prefer_progressive_data_movement true
+
+To make PGs that are *already* remapped ``active+clean`` again (for example,
+after a change made before the option was enabled), the same pinning logic
+can be applied on demand:
+
+.. prompt:: bash $
+
+   ceph osd pin-remapped-pgs
+
+Requirements and limitations:
+
+* ``require-min-compat-client`` must be ``luminous`` or newer, as with any
+  use of ``pg-upmap``.
+* The balancer should be enabled and in ``upmap`` mode; otherwise, pinned
+  PGs simply remain where they are.
+* To drain OSDs progressively, reduce their CRUSH weight to a small non-zero
+  value (for example ``0.001``) rather than ``0``, and do not mark them
+  ``out``: upmap entries that point to out or zero-weight OSDs are invalid
+  and are automatically cancelled, in which case the affected PGs backfill
+  immediately as usual.
+* Pinning is skipped for degraded or undersized PGs (redundancy must be
+  restored by recovery or backfill, not deferred), and when OSDs come back
+  ``up`` or ``in`` (returning OSDs must be repopulated).
+* PG merges (``pg_num`` decreases) are never pinned: a merge source must be
+  colocated with its merge target before merging, so this data movement
+  cannot be deferred. It is already throttled by ``target_max_misplaced_ratio``.
+* After a CRUSH rule change, pins whose placement would violate the new rule
+  (for example, two replicas in the same failure domain after switching from
+  ``host`` to ``rack`` failure domain) are automatically cancelled and those
+  PGs backfill immediately: only the movement that the new rule strictly
+  requires happens at once.
+* A pinned cluster reports ``HEALTH_OK`` even though data is not yet where
+  CRUSH wants it. Use ``ceph osd dump | grep pg_upmap_items | wc -l`` to
+  monitor how many pins remain.
