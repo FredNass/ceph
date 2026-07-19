@@ -1542,6 +1542,279 @@ void OSDMonitor::prime_pg_temp(
   }
 }
 
+
+// Build the pg_upmap_items entries needed to pin pgid, whose placement in
+// 'map' differs from where its data currently is, back to its current
+// 'acting' set, so that no data has to move.  This mirrors the logic of
+// the well-known "upmap-remapped" community tool.  Returns false if pgid
+// cannot (or need not) be pinned.
+static bool build_pin_upmap_items(
+  const OSDMap& map,
+  pg_t pgid,
+  const vector<int>& acting,
+  vector<pair<int32_t,int32_t>> *items)
+{
+  const pg_pool_t *pool = map.get_pg_pool(pgid.pool());
+  if (!pool) {
+    return false;
+  }
+  if (acting.size() != (size_t)pool->get_size()) {
+    // degraded or undersized: data needs to be recovered, not pinned
+    return false;
+  }
+  for (auto osd : acting) {
+    if (osd == CRUSH_ITEM_NONE) {
+      return false;
+    }
+    if (!map.exists(osd) || !map.is_up(osd) || map.get_weight(osd) == 0) {
+      // pinning to a down/out osd would leave the pg degraded
+      return false;
+    }
+    if (map.crush->get_item_weightf(osd) <= 0) {
+      // clean_pg_upmaps() would immediately cancel such an entry; to
+      // drain an osd progressively, lower its crush weight to a small
+      // non-zero value instead of zero
+      return false;
+    }
+  }
+  vector<int> raw;
+  int raw_primary;
+  map.pg_to_raw_osds(pgid, &raw, &raw_primary);
+  if (raw.size() != acting.size()) {
+    return false;
+  }
+  // positional diff between the new crush placement and the current
+  // acting set
+  vector<pair<int32_t,int32_t>> pairs;
+  for (unsigned i = 0; i < raw.size(); ++i) {
+    if (raw[i] == CRUSH_ITEM_NONE) {
+      return false;
+    }
+    if (raw[i] != acting[i]) {
+      pairs.push_back(make_pair(raw[i], acting[i]));
+    }
+  }
+  if (pairs.empty()) {
+    return false;
+  }
+  items->clear();
+  if (pool->is_replicated()) {
+    // order is not significant for replicated pools; build disjoint
+    // from/to sets so that the entries are independent of each other
+    // (_apply_upmap does not cope with indirect mappings)
+    vector<int32_t> from, to;
+    for (auto osd : raw) {
+      if (std::find(acting.begin(), acting.end(), osd) == acting.end()) {
+        from.push_back(osd);
+      }
+    }
+    for (auto osd : acting) {
+      if (std::find(raw.begin(), raw.end(), osd) == raw.end()) {
+        to.push_back(osd);
+      }
+    }
+    if (from.size() != to.size() || from.empty()) {
+      // pure reordering (or nothing to do): no data would move anyway
+      return false;
+    }
+    for (unsigned i = 0; i < from.size(); ++i) {
+      items->push_back(make_pair(from[i], to[i]));
+    }
+  } else {
+    // erasure-coded pools: positions are significant.  _apply_upmap()
+    // applies entries in order and skips an entry whose target is
+    // already present in the working set, so order the entries such
+    // that an osd is mapped away from before another entry maps to it
+    // (chains), and drop entries forming pure rotations, which
+    // pg_upmap_items cannot express.
+    vector<int> cur(raw);
+    vector<pair<int32_t,int32_t>> remaining(pairs);
+    bool progress = true;
+    while (progress && !remaining.empty()) {
+      progress = false;
+      for (auto p = remaining.begin(); p != remaining.end(); ++p) {
+        if (std::find(cur.begin(), cur.end(), p->second) != cur.end()) {
+          continue;  // target still in the set; retry this entry later
+        }
+        auto q = std::find(cur.begin(), cur.end(), p->first);
+        if (q != cur.end()) {
+          *q = p->second;
+          items->push_back(*p);
+        }
+        remaining.erase(p);
+        progress = true;
+        break;
+      }
+    }
+  }
+  return !items->empty();
+}
+
+void OSDMonitor::maybe_pin_remapped_pgs()
+{
+  if (osdmap.require_min_compat_client < ceph_release_t::luminous) {
+    dout(10) << __func__ << " min_compat_client "
+             << osdmap.require_min_compat_client
+             << " < luminous, which is required for pg-upmap; not pinning"
+             << dendl;
+    return;
+  }
+
+  bool all = false;
+  if (pending_inc.crush.length()) {
+    // new crush map: osds/buckets added, reweighted, rules changed, ...
+    dout(10) << __func__ << " new crush map, all" << dendl;
+    all = true;
+  }
+  if (!all) {
+    for (auto& [pool_id, pi] : pending_inc.new_pools) {
+      const pg_pool_t *cur = osdmap.get_pg_pool(pool_id);
+      if (!cur) {
+        continue;  // new pool: its pgs are created in place
+      }
+      if (pi.get_pgp_num() > cur->get_pgp_num() ||
+          pi.get_crush_rule() != cur->get_crush_rule()) {
+        dout(10) << __func__ << " pool " << pool_id
+                 << " pgp_num increase or crush rule change, all" << dendl;
+        all = true;
+        break;
+      }
+    }
+  }
+
+  // Note: we deliberately do not react to osds coming (back) up or in:
+  // in that case data on the returning osds needs to be recovered or
+  // backfilled, and pinning pgs away from them would leave the cluster
+  // degraded.  See maybe_prime_pg_temp() for that case.
+  set<int> osds;
+  for (auto p = pending_inc.new_weight.begin();
+       !all && p != pending_inc.new_weight.end();
+       ++p) {
+    if (osdmap.exists(p->first) && p->second < osdmap.get_weight(p->first)) {
+      // weight reduction: pgs move off this osd, and we know which ones
+      osds.insert(p->first);
+    } else {
+      // weight increase: pgs move toward this osd from anywhere
+      dout(10) << __func__ << " osd." << p->first << " weight increase, all"
+               << dendl;
+      all = true;
+    }
+  }
+
+  if (!all && osds.empty()) {
+    return;
+  }
+
+  OSDMap next;
+  next.deepish_copy_from(osdmap);
+  next.apply_incremental(pending_inc);
+
+  if (next.get_pools().empty()) {
+    dout(10) << __func__ << " no pools, nothing to pin" << dendl;
+  } else if (all) {
+    PinRemappedJob job(next, this);
+    mapper.queue(&job, g_conf()->mon_osd_mapping_pgs_per_chunk, {});
+    if (job.wait_for(g_conf()->mon_osd_prime_pg_temp_max_time)) {
+      dout(10) << __func__ << " done in " << job.get_duration() << dendl;
+    } else {
+      dout(10) << __func__ << " did not finish in "
+               << g_conf()->mon_osd_prime_pg_temp_max_time
+               << ", stopping; unpinned pgs will backfill normally" << dendl;
+      job.abort();
+    }
+  } else {
+    dout(10) << __func__ << " " << osds.size() << " interesting osds" << dendl;
+    utime_t stop = ceph_clock_now();
+    stop += g_conf()->mon_osd_prime_pg_temp_max_time;
+    const int chunk = 1000;
+    int n = chunk;
+    std::unordered_set<pg_t> did_pgs;
+    for (auto osd : osds) {
+      auto& pgs = mapping.get_osd_acting_pgs(osd);
+      dout(20) << __func__ << " osd." << osd << " " << pgs << dendl;
+      for (auto pgid : pgs) {
+        if (!did_pgs.insert(pgid).second) {
+          continue;
+        }
+        pin_remapped_pg(next, pgid);
+        if (--n <= 0) {
+          n = chunk;
+          if (ceph_clock_now() > stop) {
+            dout(10) << __func__ << " consumed more than "
+                     << g_conf()->mon_osd_prime_pg_temp_max_time
+                     << " seconds, stopping" << dendl;
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+void OSDMonitor::pin_remapped_pg(const OSDMap& next, pg_t pgid)
+{
+  if (creating_pgs.pgs.count(pgid)) {
+    return;
+  }
+  if (!osdmap.pg_exists(pgid)) {
+    return;
+  }
+  const pg_pool_t *pool = next.get_pg_pool(pgid.pool());
+  const pg_pool_t *cur_pool = osdmap.get_pg_pool(pgid.pool());
+  if (!pool || !cur_pool) {
+    return;
+  }
+  // never interfere with pg merging: a merge source has to move to its
+  // merge target's location before the merge can proceed
+  if (pool->get_pg_num_target() < pool->get_pg_num() ||
+      pool->get_pg_num_pending() < pool->get_pg_num() ||
+      pool->get_pgp_num() < cur_pool->get_pgp_num()) {
+    return;
+  }
+  {
+    std::lock_guard l(pin_remapped_lock);
+    // don't second-guess explicit upmap changes made in this same epoch
+    // (by the balancer or an administrator); we would fight against them
+    if (pending_inc.new_pg_upmap_items.count(pgid) ||
+        pending_inc.old_pg_upmap_items.count(pgid) ||
+        pending_inc.new_pg_upmap.count(pgid) ||
+        pending_inc.old_pg_upmap.count(pgid)) {
+      return;
+    }
+  }
+
+  vector<int> up, acting;
+  mapping.get(pgid, &up, nullptr, &acting, nullptr);
+  if (up != acting) {
+    // pg is already remapped; see 'ceph osd pin-remapped-pgs'
+    return;
+  }
+
+  vector<int> next_up, next_acting;
+  int next_up_primary, next_acting_primary;
+  next.pg_to_up_acting_osds(pgid, &next_up, &next_up_primary,
+                            &next_acting, &next_acting_primary);
+  if (next_up == acting) {
+    return;  // no change
+  }
+
+  vector<pair<int32_t,int32_t>> items;
+  if (!build_pin_upmap_items(next, pgid, acting, &items)) {
+    return;
+  }
+
+  dout(20) << __func__ << " " << pgid << " " << up << "/" << acting
+           << " -> " << next_up << "/" << next_acting
+           << ", pinning with pg_upmap_items " << items
+           << dendl;
+  {
+    std::lock_guard l(pin_remapped_lock);
+    pending_inc.new_pg_upmap_items[pgid] =
+      mempool::osdmap::vector<pair<int32_t,int32_t>>(items.begin(),
+                                                     items.end());
+  }
+}
+
 /**
  * @note receiving a transaction in this function gives a fair amount of
  * freedom to the service implementation if it does need it. It shouldn't.
@@ -1573,6 +1846,9 @@ void OSDMonitor::encode_pending(MonitorDBStore::TransactionRef t)
 	      << mapping_job.get() << " is prior epoch "
 	      << mapping.get_epoch() << dendl;
     } else {
+      if (g_conf().get_val<bool>("mon_osd_prefer_progressive_data_movement")) {
+	maybe_pin_remapped_pgs();
+      }
       if (g_conf()->mon_osd_prime_pg_temp) {
 	maybe_prime_pg_temp();
       }
@@ -13317,6 +13593,73 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       ceph_abort_msg("invalid upmap option");
     }
 
+    goto update;
+  } else if (prefix == "osd pin-remapped-pgs") {
+    // Pin every remapped pg to its current acting set with pg_upmap_items
+    // entries, so that it becomes active+clean without moving any data.
+    // The upmap balancer will progressively remove these entries later,
+    // moving the data at a controlled pace.  This is the one-shot
+    // equivalent of the behavior that can be permanently enabled with
+    // mon_osd_prefer_progressive_data_movement, and of the well-known
+    // "upmap-remapped" community tool.
+    if (osdmap.require_min_compat_client < ceph_release_t::luminous) {
+      ss << "min_compat_client "
+	 << osdmap.require_min_compat_client
+	 << " < luminous, which is required for pg-upmap. "
+	 << "Try 'ceph osd set-require-min-compat-client luminous' "
+	 << "before using this command";
+      err = -EPERM;
+      goto reply_no_propose;
+    }
+    {
+      int pinned = 0, skipped = 0;
+      for (auto pg : *osdmap.pg_temp) {
+	pg_t pgid = pg.first;
+	if (!osdmap.pg_exists(pgid)) {
+	  continue;
+	}
+	if (pending_inc.new_pg_upmap_items.count(pgid) ||
+	    pending_inc.old_pg_upmap_items.count(pgid) ||
+	    pending_inc.new_pg_upmap.count(pgid) ||
+	    pending_inc.old_pg_upmap.count(pgid)) {
+	  skipped++;
+	  continue;
+	}
+	const pg_pool_t *pool = osdmap.get_pg_pool(pgid.pool());
+	if (!pool ||
+	    pool->get_pg_num_target() < pool->get_pg_num() ||
+	    pool->get_pg_num_pending() < pool->get_pg_num() ||
+	    pool->get_pgp_num_target() < pool->get_pgp_num()) {
+	  // never interfere with pg merging
+	  skipped++;
+	  continue;
+	}
+	vector<int> up, acting;
+	int up_primary, acting_primary;
+	osdmap.pg_to_up_acting_osds(pgid, &up, &up_primary,
+				    &acting, &acting_primary);
+	if (up == acting) {
+	  continue;  // stale pg_temp; nothing to pin
+	}
+	vector<pair<int32_t,int32_t>> items;
+	if (!build_pin_upmap_items(osdmap, pgid, acting, &items)) {
+	  skipped++;
+	  continue;
+	}
+	dout(10) << __func__ << " pinning " << pgid << " to " << acting
+		 << " with pg_upmap_items " << items << dendl;
+	pending_inc.new_pg_upmap_items[pgid] =
+	  mempool::osdmap::vector<pair<int32_t,int32_t>>(items.begin(),
+							 items.end());
+	pinned++;
+      }
+      ss << "pinned " << pinned << " remapped pg(s) to their acting set, "
+	 << "skipped " << skipped;
+      if (pinned == 0) {
+	err = 0;
+	goto reply_no_propose;
+      }
+    }
     goto update;
   } else if (prefix == "osd primary-affinity") {
     int64_t id;

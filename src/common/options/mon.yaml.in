@@ -1127,6 +1127,29 @@ options:
   services:
   - mon
   with_legacy: true
+- name: mon_osd_prefer_progressive_data_movement
+  type: bool
+  level: advanced
+  desc: pin PGs to their current placement when a map change would remap them,
+    deferring data movement to the balancer
+  long_desc: When a cluster change (OSDs or hosts added, CRUSH weights reduced,
+    a pool's CRUSH rule changed, or pgp_num increased) would cause PGs to be
+    remapped and start backfilling, the monitor instead creates pg_upmap_items
+    entries in the same OSDMap epoch that pin the affected PGs to their
+    current placement. PGs stay active+clean and no immediate data movement
+    occurs. The balancer in upmap mode then progressively removes these
+    entries, moving data at the pace bounded by target_max_misplaced_ratio.
+    This is the native equivalent of the community 'upmap-remapped' tool.
+    Requires require-min-compat-client luminous or newer. Pinning is never
+    applied to degraded PGs, to PG merges, or to placements involving down,
+    out or zero-crush-weight OSDs. See also the 'ceph osd pin-remapped-pgs'
+    command for pinning PGs that are already remapped.
+  default: false
+  services:
+  - mon
+  see_also:
+  - mon_osd_prime_pg_temp_max_time
+  - mon_osd_mapping_pgs_per_chunk
 - name: mon_osd_blocklist_default_expire
   type: float
   level: advanced
