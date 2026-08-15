@@ -469,6 +469,24 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             desc='max number of osds that will be drained simultaneously when osds are removed'
         ),
         Option(
+            'upgrade_image_mirror_method',
+            type='str',
+            default='',
+            enum_allowed=['', 'none', 'registry'],
+            desc='Pre-distribute the upgrade target image to in-scope hosts before '
+                 'any daemon is upgraded. Empty or "none" (default): disabled. '
+                 '"registry": pull in parallel on each in-scope host from the '
+                 'cluster registry (requires registry reachability from hosts; '
+                 'digests/version learned from those pulls).',
+        ),
+        Option(
+            'upgrade_image_mirror_max_parallel',
+            type='int',
+            default=8,
+            desc='Maximum number of hosts pulling the upgrade image in parallel '
+                 'when upgrade_image_mirror_method is registry.',
+        ),
+        Option(
             'service_discovery_port',
             type='int',
             default=8765,
@@ -585,6 +603,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.secure_monitoring_stack = False
             self.apply_spec_fails: List[Tuple[str, str]] = []
             self.max_osd_draining_count = 10
+            self.upgrade_image_mirror_method = ''
+            self.upgrade_image_mirror_max_parallel = 8
             self.device_enhanced_scan = False
             self.inventory_list_all = False
             self.cgroups_split = True
