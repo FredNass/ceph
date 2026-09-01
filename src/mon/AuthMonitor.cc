@@ -500,9 +500,16 @@ bool AuthMonitor::check_health()
       }
     }
     if (!details.empty()) {
-      auto& check = next.add("AUTH_INSECURE_KEYS_ALLOWED", HEALTH_WARN, "Monitors are configured to allow auth using insecure key types", details.size());
-      for (auto& detail : details) {
-        check.detail.push_back(detail);
+      /* N.B.: only the health check is silenced by
+       * mon_warn_on_insecure_keys_allowed. The mon_auth_allow_insecure_key
+       * default below is still updated so that silencing the warning never
+       * changes which keys the Monitors will issue.
+       */
+      if (cct->_conf.get_val<bool>("mon_warn_on_insecure_keys_allowed")) {
+        auto& check = next.add("AUTH_INSECURE_KEYS_ALLOWED", HEALTH_WARN, "Monitors are configured to allow auth using insecure key types", details.size());
+        for (auto& detail : details) {
+          check.detail.push_back(detail);
+        }
       }
       /* So that existing clusters continue to allow issuing older key types. */
       cct->_conf.set_val_default("mon_auth_allow_insecure_key", "true");
@@ -511,7 +518,8 @@ bool AuthMonitor::check_health()
     }
   }
 
-  if (cct->_conf.get_val<bool>("mon_auth_allow_insecure_key")) {
+  if (cct->_conf.get_val<bool>("mon_auth_allow_insecure_key") &&
+      cct->_conf.get_val<bool>("mon_warn_on_insecure_keys_creatable")) {
     next.add("AUTH_INSECURE_KEYS_CREATABLE", HEALTH_WARN, "Monitors are configured to allow creation of insecure key types", 1);
   }
 
@@ -594,7 +602,8 @@ bool AuthMonitor::check_health()
       }
     }
   }
-  if (!bad_key_client_detail.empty()) {
+  if (!bad_key_client_detail.empty() &&
+      cct->_conf.get_val<bool>("mon_warn_on_insecure_client_key_type")) {
     std::ostringstream summary;
     summary << bad_key_client_detail.size() << " auth client entities with insecure key types";
     auto& check = next.add("AUTH_INSECURE_CLIENT_KEY_TYPE", HEALTH_WARN, summary.str(), bad_key_client_detail.size());

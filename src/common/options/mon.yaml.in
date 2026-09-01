@@ -865,6 +865,62 @@ options:
   flags:
   - startup
   - no_mon_update
+- name: mon_warn_on_insecure_client_key_type
+  type: bool
+  level: advanced
+  desc: Raise the AUTH_INSECURE_CLIENT_KEY_TYPE health warning if any client
+    entity has a key with an insecure cipher type
+  long_desc: >
+    A client key can only be rotated to a secure cipher type once every
+    consumer of that key understands the new type. On clusters with long-lived,
+    externally managed, or third-party clients this migration can take a very
+    long time, during which the warning is not actionable. Setting this to
+    false suppresses the health warning only; it does not change which cipher
+    types the Monitors accept, nor which key types they will issue.
+  default: true
+  services:
+  - mon
+  see_also:
+  - mon_warn_on_insecure_keys_allowed
+  - mon_warn_on_insecure_keys_creatable
+  - mon_auth_allow_insecure_key
+- name: mon_warn_on_insecure_keys_allowed
+  type: bool
+  level: advanced
+  desc: Raise the AUTH_INSECURE_KEYS_ALLOWED health warning if the Monitors are
+    configured to allow authentication with an insecure cipher type
+  long_desc: >
+    An insecure cipher type cannot be removed from the mon map's
+    auth_allowed_ciphers until every client and daemon holds a key with a
+    secure cipher type, so this warning remains raised for the whole duration
+    of a client key migration. Setting this to false suppresses the health
+    warning only; the Monitors continue to allow exactly the cipher types
+    listed in auth_allowed_ciphers.
+  default: true
+  services:
+  - mon
+  see_also:
+  - mon_warn_on_insecure_client_key_type
+  - mon_warn_on_insecure_keys_creatable
+  - mon_auth_allow_insecure_key
+- name: mon_warn_on_insecure_keys_creatable
+  type: bool
+  level: advanced
+  desc: Raise the AUTH_INSECURE_KEYS_CREATABLE health warning if the Monitors
+    are configured to allow creation of keys with an insecure cipher type
+  long_desc: >
+    While legacy clients are still being provisioned, mon_auth_allow_insecure_key
+    must remain enabled so that keys they understand can be created, which
+    keeps this warning raised. Setting this to false suppresses the health
+    warning only; it does not change whether insecure keys may be created,
+    which remains governed by mon_auth_allow_insecure_key.
+  default: true
+  services:
+  - mon
+  see_also:
+  - mon_warn_on_insecure_client_key_type
+  - mon_warn_on_insecure_keys_allowed
+  - mon_auth_allow_insecure_key
 - name: mon_auth_validate_all_caps
   type: bool
   level: advanced
