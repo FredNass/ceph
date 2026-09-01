@@ -333,6 +333,17 @@ manually setting this configuration to false.
 
 .. note:: cephadm and Rook should automate this process for you.
 
+If keys with an insecure cipher type must still be created for legacy clients,
+``mon_auth_allow_insecure_key`` has to stay enabled and this warning cannot be
+resolved. In that case the warning itself can be disabled:
+
+.. prompt:: bash $
+
+    ceph config set mon mon_warn_on_insecure_keys_creatable false
+
+This suppresses only the health warning; whether insecure keys may be created
+is still governed by ``mon_auth_allow_insecure_key``.
+
 
 .. _auth-insecure-service-tickets:
 
@@ -512,6 +523,19 @@ Do this for each client.
 
 .. note:: Rook should automate this process for you. cephadm does not generally administer client credentials.
 
+If the migration of client keys is expected to take a long time, the warning
+can be disabled outright rather than muted:
+
+.. prompt:: bash $
+
+    ceph config set mon mon_warn_on_insecure_client_key_type false
+
+Unlike ``ceph health mute``, this does not need to be renewed when the number
+of affected clients grows, and it is visible in ``ceph config dump``. It
+suppresses only the health warning: the Monitors still accept exactly the
+cipher types listed in ``auth_allowed_ciphers``, and ``ceph auth ls`` still
+reports each entity's key type.
+
 
 .. _auth-insecure-keys-allowed:
 
@@ -603,6 +627,18 @@ outputs
 The warning should now be resolved.
 
 .. note:: Rook should automate this process for you. cephadm will not change this as it may adversely affect existing clients.
+
+Because ``aes`` cannot be removed from ``auth_allowed_ciphers`` until every
+client has been migrated, this warning is raised for the entire duration of a
+client key migration. It can be disabled in the meantime:
+
+.. prompt:: bash $
+
+    ceph config set mon mon_warn_on_insecure_keys_allowed false
+
+This suppresses only the health warning. The Monitors continue to allow
+exactly the cipher types listed in ``auth_allowed_ciphers``, which remains
+visible in ``ceph mon dump``.
 
 
 .. _auth-emergency-ciphers-set:
