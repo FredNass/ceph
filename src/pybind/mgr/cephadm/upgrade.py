@@ -685,7 +685,7 @@ class CephadmUpgrade:
         again), livelocking the one-filesystem-at-a-time sequencing.
         """
         fs_names = {
-            d.service_name().removeprefix('mds.')
+            d.service_name()[len('mds.'):]
             for d in daemons
             if d.service_name() and d.service_name().startswith('mds.')
         }
@@ -711,7 +711,7 @@ class CephadmUpgrade:
         for d_entry in need_upgrade:
             svc = d_entry[0].service_name()
             if svc and svc.startswith('mds.'):
-                by_fs.setdefault(svc.removeprefix('mds.'), []).append(d_entry)
+                by_fs.setdefault(svc[len('mds.'):], []).append(d_entry)
             else:
                 passthrough.append(d_entry)
         if not by_fs:
