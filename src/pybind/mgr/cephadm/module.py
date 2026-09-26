@@ -487,6 +487,16 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                  'when upgrade_image_mirror_method is registry.',
         ),
         Option(
+            'upgrade_skip_order_check',
+            type='bool',
+            default=False,
+            desc='Let `ceph orch upgrade start` with --daemon-types, --services or '
+                 '--hosts proceed even when daemons of types earlier in the upgrade '
+                 'order (mgr -> mon -> crash -> osd -> mds -> ...) are not on the '
+                 'target image yet. The active mgr must still be on the target image. '
+                 'Meant for testing a single daemon type; leave off in production.'
+        ),
+        Option(
             'service_discovery_port',
             type='int',
             default=8765,
@@ -605,6 +615,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.max_osd_draining_count = 10
             self.upgrade_image_mirror_method = ''
             self.upgrade_image_mirror_max_parallel = 8
+            self.upgrade_skip_order_check = False
             self.device_enhanced_scan = False
             self.inventory_list_all = False
             self.cgroups_split = True

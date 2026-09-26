@@ -138,6 +138,13 @@ Starting the upgrade
 
       ceph config set mgr mgr/cephadm/upgrade_fs_one_at_a_time false
 
+   To test the MDS phase alone on a cluster whose monitors and OSDs already
+   run a compatible release, the upgrade order check of a filtered upgrade
+   (``--daemon-types``, ``--services``, ``--hosts``) can be bypassed with
+   ``ceph config set mgr mgr/cephadm/upgrade_skip_order_check true``; the
+   active mgr must still be on the target image. This is a testing aid, not
+   something to leave enabled.
+
 Before you use cephadm to upgrade Ceph, verify that all hosts are currently online and that your cluster is healthy by running the following command:
 
 .. prompt:: bash #
