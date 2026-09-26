@@ -758,6 +758,38 @@ def test_staggered_upgrade_validation(
             'new_image_name', daemon_types, hosts, services)
 
 
+@mock.patch("cephadm.module.HostCache.get_daemons")
+@mock.patch("cephadm.serve.CephadmServe._get_container_image_info")
+def test_staggered_upgrade_skip_order_check(get_image_info, get_daemons,
+                                            cephadm_module: CephadmOrchestrator):
+    # mgr on the target image, mon/osd not: --daemon-types mds is refused by
+    # default and accepted with upgrade_skip_order_check. An un-upgraded
+    # active mgr is still refused either way.
+    new, old = 'new_image@repo_digest', 'old_image@repo_digest'
+
+    def dd(t, host, did, digest):
+        return DaemonDescription(daemon_type=t, hostname=host, daemon_id=did,
+                                 container_image_digests=[digest], deployed_by=[digest])
+
+    get_image_info.side_effect = async_side_effect(
+        ('new_id', 'ceph version 99.99.99 (hash)', [new]))
+    get_daemons.return_value = [
+        dd('mgr', 'a', 'a.x', new), dd('mon', 'a', 'a', old),
+        dd('osd', 'a', '0', old), dd('mds', 'a', 'fs.a.q', old)]
+
+    with pytest.raises(OrchestratorError, match='earlier in upgrade order'):
+        cephadm_module.upgrade._validate_upgrade_filters('new_image_name', ['mds'], None, None)
+
+    cephadm_module.upgrade_skip_order_check = True
+    cephadm_module.upgrade._validate_upgrade_filters('new_image_name', ['mds'], None, None)
+
+    with mock.patch.object(CephadmUpgrade, '_detect_need_upgrade',
+                           return_value=(True, [], [], 0)):
+        with pytest.raises(OrchestratorError, match='Please first upgrade'):
+            cephadm_module.upgrade._validate_upgrade_filters(
+                'new_image_name', ['mds'], None, None)
+
+
 def _mds_entries_for_services(*service_names):
     # Build (DaemonDescription, bool) entries like _detect_need_upgrade returns,
     # one MDS per given service name (service_name is 'mds.<fs>').

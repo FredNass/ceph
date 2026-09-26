@@ -481,6 +481,12 @@ class CephadmUpgrade:
             daemons = _get_earlier_daemons([_latest_type(dtypes)], other_hosts_daemons)
             err_msg_base += 'Daemons with types earlier in upgrade order than daemons on given host need upgrading.\n'
         need_upgrade_self, n1, n2, _ = self._detect_need_upgrade(daemons, target_digests, target_name)
+        if (n1 or n2) and getattr(self.mgr, 'upgrade_skip_order_check', False):
+            logger.warning(
+                'Upgrade: upgrade_skip_order_check is set; starting a filtered upgrade '
+                'although %s still need upgrading',
+                ', '.join(sorted(set(d[0].name() for d in n1 + n2))))
+            n1, n2 = [], []
         if need_upgrade_self and ('mgr' not in dtypes or (daemon_types is None and services is None)):
             # also report active mgr as needing to be upgraded. It is not included in the resulting list
             # by default as it is treated special and handled via the need_upgrade_self bool
