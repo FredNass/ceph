@@ -1,6 +1,18 @@
 >=18.2.9
 --------
 
+* cephadm: A new ``mgr/cephadm/upgrade_mds_staged`` option (default
+  ``false``, requires ``mgr/orchestrator/fail_fs = true``) makes ``ceph orch
+  upgrade`` stage the new MDS deployment on every host while the filesystem
+  is still serving, then fail the filesystem, switch all of its MDS daemons
+  to the staged deployment in parallel, verify with the monitors that every
+  daemon is back on the target release, and re-join the filesystem. The
+  filesystem is down for roughly one container restart instead of one
+  serial redeployment per MDS daemon. On failure the daemons are switched
+  back to their previous deployment and the filesystem is re-joined on the
+  previous release. The cephadm binary gains ``deploy --stage`` and a
+  ``switch-staged`` command to support this.
+
 * cephadm: During ``ceph orch upgrade``, CephFS filesystems are now prepared
   and restored one at a time during the MDS phase, so at most one filesystem
   is offline (``fail_fs = true``) or degraded (scaled down to ``max_mds 1``)

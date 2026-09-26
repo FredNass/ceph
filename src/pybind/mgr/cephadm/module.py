@@ -487,6 +487,41 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                  'when upgrade_image_mirror_method is registry.',
         ),
         Option(
+            'upgrade_mds_staged',
+            type='bool',
+            default=False,
+            desc='With fail_fs, stage the MDS redeploys (config, unit files, image '
+                 'check) while the filesystem is still serving, then fail it and '
+                 'switch every MDS in parallel, and re-join it as soon as the '
+                 'monitors report all MDS back on the target version. The '
+                 'filesystem is down for one container stop/start plus journal '
+                 'replay instead of one full redeploy per MDS.'
+        ),
+        Option(
+            'upgrade_mds_staged_max_parallel',
+            type='int',
+            default=16,
+            desc='Maximum number of concurrent staged MDS deploys / switches.'
+        ),
+        Option(
+            'upgrade_mds_staged_switch_timeout',
+            type='int',
+            default=120,
+            desc='Seconds to wait, after switching a failed filesystem\'s MDS to '
+                 'the staged image, for the monitors to see every one of them '
+                 'back as a standby on the target version. On timeout the MDS '
+                 'are rolled back to the previous image, the filesystem is '
+                 're-joined and the upgrade is paused.'
+        ),
+        Option(
+            'upgrade_mds_fail_unhealthy_fs',
+            type='bool',
+            default=False,
+            desc='Pass --yes-i-really-mean-it to `fs fail` when the monitors refuse '
+                 'to fail a filesystem whose MDS report MDS_TRIM or '
+                 'MDS_CACHE_OVERSIZED (Tentacle and later).'
+        ),
+        Option(
             'service_discovery_port',
             type='int',
             default=8765,
@@ -605,6 +640,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.max_osd_draining_count = 10
             self.upgrade_image_mirror_method = ''
             self.upgrade_image_mirror_max_parallel = 8
+            self.upgrade_mds_staged = False
+            self.upgrade_mds_staged_max_parallel = 16
+            self.upgrade_mds_staged_switch_timeout = 120
+            self.upgrade_mds_fail_unhealthy_fs = False
             self.device_enhanced_scan = False
             self.inventory_list_all = False
             self.cgroups_split = True

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # from ceph_fs.h
 CEPH_MDSMAP_ALLOW_STANDBY_REPLAY = (1 << 5)
 CEPH_MDSMAP_NOT_JOINABLE = (1 << 0)
+CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS = (1 << 7)
 
 # Parallel registry pre-pull across many hosts. Single-command
 # default_cephadm_command_timeout (15m) is too short for multi-GB images.
@@ -86,6 +87,7 @@ class UpgradeState:
                  total_count: Optional[int] = None,
                  remaining_count: Optional[int] = None,
                  image_mirror_done: bool = False,
+                 mds_staged: Optional[Dict[str, Any]] = None,
                  ):
         self._target_name: str = target_name  # Use CephadmUpgrade.target_image instead.
         self.progress_id: str = progress_id
@@ -110,6 +112,11 @@ class UpgradeState:
         self.total_count = total_count
         self.remaining_count = remaining_count
         self.image_mirror_done = image_mirror_done
+        # Per-filesystem progress of a staged MDS upgrade (see
+        # _staged_mds_upgrade), keyed by str(fscid), so that a mgr failover
+        # in the middle of one resumes it instead of leaving the filesystem
+        # failed. Cleared once the filesystem is back.
+        self.mds_staged: Dict[str, Any] = mds_staged or {}
 
     def to_json(self) -> dict:
         return {
@@ -130,6 +137,7 @@ class UpgradeState:
             'total_count': self.total_count,
             'remaining_count': self.remaining_count,
             'image_mirror_done': self.image_mirror_done,
+            'mds_staged': self.mds_staged,
         }
 
     @classmethod
@@ -151,7 +159,9 @@ class CephadmUpgrade:
         'UPGRADE_REDEPLOY_DAEMON',
         'UPGRADE_BAD_TARGET_VERSION',
         'UPGRADE_EXCEPTION',
-        'UPGRADE_OFFLINE_HOST'
+        'UPGRADE_OFFLINE_HOST',
+        'UPGRADE_MDS_STAGE_FAILED',
+        'UPGRADE_MDS_SWITCH_FAILED',
     ]
 
     def __init__(self, mgr: "CephadmOrchestrator"):
@@ -720,6 +730,503 @@ class CephadmUpgrade:
         logger.info('Upgrade: handling MDS of filesystem %s this pass '
                     '(one filesystem at a time)' % first_fs)
         return by_fs[first_fs] + passthrough
+
+    # ------------------------------------------------------------------
+    # Staged MDS upgrade (mgr/cephadm/upgrade_mds_staged, needs fail_fs)
+    #
+    # The normal fail_fs flow fails the filesystem and *then* redeploys
+    # its MDS one cephadm call at a time; each call spends most of its
+    # time on work that does not need the filesystem to be down (starting
+    # cephadm on the host, a throwaway container to look up uid/gid in the
+    # target image, writing unit files, daemon-reload), and the filesystem
+    # is only re-joined once cephadm's own daemon cache catches up.
+    #
+    # Here all of that is moved out of the outage window:
+    #
+    #   stage    deploy --stage on every MDS while the filesystem serves:
+    #            config, keyring, unit.*.staged, image executed once with
+    #            --version. Anything that can go wrong with the image goes
+    #            wrong here, with the filesystem still up.
+    #   fail     flush the MDS journals, disable standby-replay, fs fail.
+    #   switch   cephadm switch-staged on every MDS, all hosts in parallel:
+    #            one container stop/start each.
+    #   verify   read the monitors, not cephadm's cache: every MDS is back
+    #            as up:standby with a new gid and the target version, and no
+    #            standby that could be picked for this filesystem still runs
+    #            the old version (an old standby would take rank 0, and the
+    #            monitors would then refuse every new-version standby).
+    #   re-join  fs set joinable true, wait for the ranks, restore
+    #            standby-replay, refresh cephadm's cache for the hosts.
+    #
+    # If the switch or the verification fails the MDS are rolled back to
+    # their previous unit files, the filesystem is re-joined on the old
+    # version and the upgrade is paused. Progress is persisted per
+    # filesystem in UpgradeState.mds_staged so a mgr failover resumes it.
+    # ------------------------------------------------------------------
+
+    def _staged_mds_enabled(self) -> bool:
+        assert self.upgrade_state is not None
+        if not getattr(self.mgr, 'upgrade_mds_staged', False):
+            return False
+        if not self.upgrade_state.fail_fs:
+            logger.warning('Upgrade: upgrade_mds_staged is set but '
+                           'mgr/orchestrator/fail_fs is not; MDS will be '
+                           'upgraded the regular way')
+            return False
+        return True
+
+    def _staged_mds_state(self, fscid: int) -> Dict[str, Any]:
+        assert self.upgrade_state is not None
+        return self.upgrade_state.mds_staged.setdefault(str(fscid), {})
+
+    def _staged_mds_clear(self, fscid: int) -> None:
+        assert self.upgrade_state is not None
+        self.upgrade_state.mds_staged.pop(str(fscid), None)
+        self._save_upgrade_state()
+
+    def _fs_by_id(self, fscid: int) -> Optional[Dict[str, Any]]:
+        for fs in self.mgr.get("fs_map").get('filesystems', []):
+            if fs['id'] == fscid:
+                return fs
+        return None
+
+    def _mds_metadata_versions(self) -> Dict[str, str]:
+        """MDS daemon name -> ceph_version_short, from the monitors."""
+        ret, out, err = self.mgr.check_mon_command({
+            'prefix': 'mds metadata', 'format': 'json'})
+        versions: Dict[str, str] = {}
+        try:
+            for md in json.loads(out or '[]'):
+                v = md.get('ceph_version_short') or ''
+                if not v and md.get('ceph_version', '').startswith('ceph version '):
+                    v = md['ceph_version'].split(' ')[2]
+                if md.get('name'):
+                    versions[md['name']] = v
+        except (ValueError, TypeError, AttributeError):
+            logger.warning('Upgrade: could not parse `mds metadata`: %s', out)
+        return versions
+
+    def _fsmap_standbys(self) -> List[Dict[str, Any]]:
+        return list(self.mgr.get("fs_map").get('standbys', []))
+
+    def _mds_gids(self, names: List[str]) -> Dict[str, int]:
+        """name -> gid for every MDS the monitors know about."""
+        fsmap = self.mgr.get("fs_map")
+        gids: Dict[str, int] = {}
+        for info in fsmap.get('standbys', []):
+            if info.get('name') in names:
+                gids[info['name']] = info['gid']
+        for fs in fsmap.get('filesystems', []):
+            for info in (fs['mdsmap'].get('info') or {}).values():
+                if info.get('name') in names:
+                    gids[info['name']] = info['gid']
+        return gids
+
+    def _staged_mds_check_preconditions(
+        self,
+        fs_names: List[str],
+        daemons: List[DaemonDescription],
+    ) -> Optional[str]:
+        """Return a reason not to start a staged upgrade of fs_names, or None."""
+        fsmap = self.mgr.get("fs_map")
+        by_name = {fs['mdsmap']['fs_name']: fs for fs in fsmap.get('filesystems', [])}
+        hosts = {d.hostname for d in daemons if d.hostname}
+        offline = sorted(h for h in hosts if h in self.mgr.offline_hosts)
+        if offline:
+            return f'host(s) {", ".join(offline)} offline'
+        # An MDS in our set that holds a rank / standby-replay in a
+        # filesystem we are NOT about to fail would be restarted under a
+        # live filesystem.
+        names = {d.name().split('.', 1)[1] for d in daemons}
+        for fs in fsmap.get('filesystems', []):
+            if fs['mdsmap']['fs_name'] in fs_names:
+                continue
+            for info in (fs['mdsmap'].get('info') or {}).values():
+                if info.get('name') in names:
+                    return (f'mds.{info["name"]} currently serves filesystem '
+                            f'{fs["mdsmap"]["fs_name"]} ({info.get("state")})')
+        for fs_name in fs_names:
+            fs = by_name.get(fs_name)
+            if fs is None:
+                return f'filesystem {fs_name} not found'
+            mdsmap = fs['mdsmap']
+            if mdsmap.get('damaged'):
+                return f'filesystem {fs_name} has damaged rank(s) {mdsmap["damaged"]}'
+            if len(by_name) > 1 and not (mdsmap['flags'] & CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS):
+                logger.warning(
+                    'Upgrade: filesystem %s does not have '
+                    'refuse_standby_for_another_fs set; a standby from another '
+                    'filesystem could take one of its ranks while it is being '
+                    'upgraded. Consider `ceph fs set %s refuse_standby_for_another_fs true`',
+                    fs_name, fs_name)
+        return None
+
+    async def _staged_mds_stage_all(
+        self,
+        daemons: List[DaemonDescription],
+        target_image: str,
+    ) -> Dict[str, str]:
+        """deploy --stage every daemon, hosts in parallel. name -> error."""
+        sem = asyncio.Semaphore(max(1, int(self.mgr.upgrade_mds_staged_max_parallel)))
+        errors: Dict[str, str] = {}
+
+        async def one(d: DaemonDescription) -> None:
+            assert d.daemon_id is not None and d.hostname is not None
+            async with sem:
+                try:
+                    self.mgr._daemon_action_set_image('redeploy', target_image, 'mds', d.daemon_id)
+                    spec = CephadmDaemonDeploySpec.from_daemon_description(d)
+                    spec = self.mgr.cephadm_services['mds'].prepare_create(spec)
+                    await CephadmServe(self.mgr)._create_daemon(spec, stage=True)
+                except Exception as e:
+                    errors[d.name()] = str(e)
+
+        await asyncio.gather(*[one(d) for d in daemons])
+        return errors
+
+    async def _staged_mds_switch_all(
+        self,
+        daemons: List[DaemonDescription],
+        target_image: str,
+        rollback: bool = False,
+    ) -> Dict[str, str]:
+        """cephadm switch-staged every daemon, hosts in parallel. name -> error."""
+        sem = asyncio.Semaphore(max(1, int(self.mgr.upgrade_mds_staged_max_parallel)))
+        errors: Dict[str, str] = {}
+
+        async def one(d: DaemonDescription) -> None:
+            assert d.hostname is not None
+            args = ['--name', d.name(), '--expected-image', target_image]
+            if rollback:
+                args = ['--name', d.name(), '--rollback']
+            async with sem:
+                try:
+                    out, err, code = await CephadmServe(self.mgr)._run_cephadm(
+                        d.hostname, d.name(), 'switch-staged', args,
+                        image=target_image, error_ok=True)
+                    if code:
+                        errors[d.name()] = '\n'.join(err) or f'exit code {code}'
+                except Exception as e:
+                    errors[d.name()] = str(e)
+
+        await asyncio.gather(*[one(d) for d in daemons])
+        return errors
+
+    def _staged_mds_all_back(
+        self,
+        fscids: List[int],
+        names: List[str],
+        pre_gids: Dict[str, int],
+        target_version: Optional[str],
+    ) -> Tuple[bool, str]:
+        """The monitors' view after a switch/rollback.
+
+        True when every daemon in `names` is up:standby with a gid that
+        differs from the one it had before, and (target_version given)
+        every standby that could be picked for one of `fscids` runs it.
+        """
+        standbys = {s['name']: s for s in self._fsmap_standbys()}
+        for n in names:
+            s = standbys.get(n)
+            if s is None:
+                return False, f'mds.{n} is not a standby yet'
+            if pre_gids.get(n) is not None and s['gid'] == pre_gids[n]:
+                return False, f'mds.{n} has not re-registered yet'
+        if target_version:
+            versions = self._mds_metadata_versions()
+            for n in names:
+                if versions.get(n) != target_version:
+                    return False, f'mds.{n} reports version {versions.get(n)!r}, want {target_version!r}'
+            # Any other standby pinned to one of our filesystems must be on
+            # the target version too: the monitors pick the first pinned
+            # standby by gid, so an old one would take rank 0 and the
+            # filesystem would then refuse every new-version standby.
+            for s in standbys.values():
+                if s.get('join_fscid') in fscids and s['name'] not in names \
+                        and versions.get(s['name']) != target_version:
+                    return False, (f'standby mds.{s["name"]} is pinned to this '
+                                   f'filesystem but runs {versions.get(s["name"])!r}')
+        return True, ''
+
+    def _staged_mds_wait(
+        self,
+        fscids: List[int],
+        names: List[str],
+        pre_gids: Dict[str, int],
+        target_version: Optional[str],
+        timeout: int,
+    ) -> Tuple[bool, str]:
+        deadline = time.time() + timeout
+        why = ''
+        while True:
+            ok, why = self._staged_mds_all_back(fscids, names, pre_gids, target_version)
+            if ok:
+                return True, ''
+            if time.time() >= deadline:
+                return False, why
+            time.sleep(2)
+
+    def _staged_mds_fail_fs(self, fs_name: str) -> None:
+        """fs fail, retrying with --yes-i-really-mean-it when allowed."""
+        ret, out, err = self.mgr.mon_command({'prefix': 'fs fail', 'fs_name': fs_name})
+        if ret == 0:
+            return
+        if 'yes-i-really-mean-it' in (err or '') and self.mgr.upgrade_mds_fail_unhealthy_fs:
+            logger.warning('Upgrade: fs fail %s refused (%s); retrying with '
+                           '--yes-i-really-mean-it as upgrade_mds_fail_unhealthy_fs is set',
+                           fs_name, err.strip())
+            ret, out, err = self.mgr.mon_command({
+                'prefix': 'fs fail', 'fs_name': fs_name, 'yes_i_really_mean_it': True})
+            if ret == 0:
+                return
+        raise OrchestratorError(f'fs fail {fs_name} failed: {err}')
+
+    def _staged_mds_flush_journals(self, fs: Dict[str, Any]) -> None:
+        for info in (fs['mdsmap'].get('info') or {}).values():
+            if info.get('state') != 'up:active':
+                continue
+            try:
+                r, outb, outs = self.mgr.tell_command('mds', info['name'], {'prefix': 'flush journal'})
+                if r:
+                    logger.info('Upgrade: flush journal on mds.%s failed (%s); replay may take longer',
+                                info['name'], outs)
+            except Exception as e:
+                logger.info('Upgrade: flush journal on mds.%s failed (%s); replay may take longer',
+                            info['name'], e)
+
+    def _staged_mds_disable_standby_replay(self, fs: Dict[str, Any], timeout: int = 90) -> None:
+        assert self.upgrade_state is not None
+        fscid, mdsmap = fs['id'], fs['mdsmap']
+        fs_name = mdsmap['fs_name']
+        if mdsmap['flags'] & CEPH_MDSMAP_ALLOW_STANDBY_REPLAY:
+            logger.info('Upgrade: Disabling standby-replay for filesystem %s', fs_name)
+            if not self.upgrade_state.fs_original_allow_standby_replay:
+                self.upgrade_state.fs_original_allow_standby_replay = {}
+            self.upgrade_state.fs_original_allow_standby_replay[fscid] = True
+            self._save_upgrade_state()
+            self.mgr.check_mon_command({
+                'prefix': 'fs set', 'fs_name': fs_name,
+                'var': 'allow_standby_replay', 'val': '0'})
+        deadline = time.time() + timeout
+        while True:
+            cur = self._fs_by_id(fscid)
+            if cur is None:
+                return
+            if not any(i.get('state') == 'up:standby-replay'
+                       for i in (cur['mdsmap'].get('info') or {}).values()):
+                return
+            if time.time() >= deadline:
+                raise OrchestratorError(
+                    f'filesystem {fs_name} still has standby-replay daemons after {timeout}s')
+            time.sleep(2)
+
+    def _staged_mds_rollback(
+        self,
+        st: Dict[str, Any],
+        daemons: List[DaemonDescription],
+        fs_names: List[str],
+        reason: str,
+    ) -> None:
+        """Undo a switch that did not complete: previous unit files back,
+        daemons back as standbys, filesystem(s) re-joined, upgrade paused."""
+        assert self.upgrade_state is not None
+        names = [d.name().split('.', 1)[1] for d in daemons]
+        logger.error('Upgrade: rolling back staged MDS switch of %s: %s',
+                     ', '.join(fs_names), reason)
+        st['phase'] = 'rolling_back'
+        self._save_upgrade_state()
+        before = self._mds_gids(names)
+        errors = self.mgr.wait_async(self._staged_mds_switch_all(daemons, st['image'], rollback=True))
+        detail = [f'{k}: {v}' for k, v in errors.items()]
+        if not errors:
+            ok, why = self._staged_mds_wait(
+                st['fscids'], names, before, None, int(self.mgr.upgrade_mds_staged_switch_timeout))
+            if not ok:
+                detail.append(f'after rollback: {why}')
+        # Whatever happened, forget the per-daemon image pins so cephadm
+        # does not redeploy the new image on its own later.
+        for d in daemons:
+            self.mgr.check_mon_command({
+                'prefix': 'config rm', 'name': 'container_image',
+                'who': name_to_config_section(d.name())})
+        if not detail:
+            self._complete_mds_upgrade(fs_names=fs_names)
+            summary = (f'MDS switch to the staged image failed for {", ".join(fs_names)} '
+                       f'({reason}); rolled back, filesystem(s) re-joined on the previous image')
+        else:
+            summary = (f'MDS switch to the staged image failed for {", ".join(fs_names)} '
+                       f'({reason}) and the rollback did not complete; the filesystem(s) '
+                       f'are left failed. Fix the MDS listed, then `ceph fs set <fs> joinable true`')
+        for fscid in st['fscids']:
+            self._staged_mds_clear(fscid)
+        self._fail_upgrade('UPGRADE_MDS_SWITCH_FAILED', {
+            'severity': 'warning',
+            'summary': summary,
+            'count': 1,
+            'detail': detail or [reason],
+        })
+
+    def _staged_mds_upgrade(
+        self,
+        need_upgrade: List[DaemonDescription],
+        target_image: str,
+        target_digests: Optional[List[str]],
+    ) -> None:
+        """Upgrade the MDS of the filesystem(s) served by `need_upgrade`
+        with a staged switch. Runs to completion (or rollback) within
+        this serve() pass; the caller returns afterwards so the next
+        pass re-evaluates what is left."""
+        assert self.upgrade_state is not None
+        target_version = self.upgrade_state.target_version
+        fs_names = sorted(self._fs_names_of_mds_daemons(need_upgrade))
+        fsmap = self.mgr.get("fs_map")
+        filesystems = [fs for fs in fsmap.get('filesystems', [])
+                       if fs['mdsmap']['fs_name'] in fs_names]
+        fscids = [fs['id'] for fs in filesystems]
+        # Every MDS of those filesystems' services, not only the ones still
+        # on the old image: fs fail restarts them all anyway, and they all
+        # need a new gid before the filesystem is re-joined.
+        daemons: List[DaemonDescription] = []
+        seen: Set[str] = set()
+        for fs_name in fs_names:
+            for d in self.mgr.cache.get_daemons_by_service(f'mds.{fs_name}'):
+                if d.name() not in seen:
+                    seen.add(d.name())
+                    daemons.append(d)
+        for d in need_upgrade:
+            if d.name() not in seen:
+                seen.add(d.name())
+                daemons.append(d)
+        names = [d.name().split('.', 1)[1] for d in daemons]
+        hosts = sorted({d.hostname for d in daemons if d.hostname})
+
+        # Resume after a mgr failover: pick the state of the first fs.
+        st = self._staged_mds_state(fscids[0]) if fscids else {}
+        if not st:
+            reason = self._staged_mds_check_preconditions(fs_names, daemons)
+            if reason:
+                self._fail_upgrade('UPGRADE_MDS_STAGE_FAILED', {
+                    'severity': 'warning',
+                    'summary': f'Cannot stage the MDS upgrade of {", ".join(fs_names)}: {reason}',
+                    'count': 1, 'detail': [reason]})
+                return
+            st.update({'phase': 'staging', 'fscids': fscids, 'fs_names': fs_names,
+                       'daemons': [d.name() for d in daemons], 'hosts': hosts,
+                       'image': target_image, 'pre_gids': {}})
+            for fscid in fscids[1:]:
+                self.upgrade_state.mds_staged[str(fscid)] = st
+            self._save_upgrade_state()
+        phase = st.get('phase')
+        logger.info('Upgrade: staged MDS upgrade of %s (%d MDS on %d host(s)), phase %s',
+                    ', '.join(fs_names), len(daemons), len(hosts), phase)
+
+        if phase == 'staging':
+            self.upgrade_info_str = f'Staging MDS of {", ".join(fs_names)}'
+            errors = self.mgr.wait_async(self._staged_mds_stage_all(daemons, target_image))
+            if errors:
+                # Nothing has been taken down; staged files are inert.
+                for fscid in fscids:
+                    self._staged_mds_clear(fscid)
+                self._fail_upgrade('UPGRADE_MDS_STAGE_FAILED', {
+                    'severity': 'warning',
+                    'summary': f'Staging the MDS upgrade of {", ".join(fs_names)} failed '
+                               f'on {len(errors)} daemon(s); nothing was restarted',
+                    'count': len(errors),
+                    'detail': [f'{k}: {v}' for k, v in errors.items()]})
+                return
+            st['phase'] = 'staged'
+            self._save_upgrade_state()
+            phase = 'staged'
+
+        if phase == 'staged':
+            self.upgrade_info_str = f'Failing filesystem(s) {", ".join(fs_names)} for MDS switch'
+            if not self.upgrade_state.fs_failed_for_upgrade:
+                self.upgrade_state.fs_failed_for_upgrade = []
+            try:
+                for fs in filesystems:
+                    self._staged_mds_flush_journals(fs)
+                    self._staged_mds_disable_standby_replay(fs)
+                st['pre_gids'] = self._mds_gids(names)
+                for fs in filesystems:
+                    if fs['id'] not in self.upgrade_state.fs_failed_for_upgrade:
+                        self.upgrade_state.fs_failed_for_upgrade.append(fs['id'])
+                st['phase'] = 'failed'
+                self._save_upgrade_state()
+                for fs in filesystems:
+                    logger.info('Upgrade: failing fs %s for staged MDS switch',
+                                fs['mdsmap']['fs_name'])
+                    self._staged_mds_fail_fs(fs['mdsmap']['fs_name'])
+            except Exception as e:
+                # Nothing has been switched: re-join whatever was failed
+                # (and restore standby-replay), keep the staged files for a
+                # retry, pause.
+                logger.error('Upgrade: could not fail %s for the staged MDS switch: %s',
+                             ', '.join(fs_names), e)
+                self._complete_mds_upgrade(fs_names=fs_names)
+                for fscid in fscids:
+                    self._staged_mds_clear(fscid)
+                self._fail_upgrade('UPGRADE_MDS_STAGE_FAILED', {
+                    'severity': 'warning',
+                    'summary': f'Could not fail filesystem(s) {", ".join(fs_names)} for the '
+                               f'staged MDS switch: {e}; nothing was restarted',
+                    'count': 1, 'detail': [str(e)]})
+                return
+            phase = 'failed'
+
+        if phase in ('failed', 'switching'):
+            self.upgrade_info_str = f'Switching MDS of {", ".join(fs_names)} to {target_image}'
+            # Resuming after a mgr failover in the middle of `fs fail`: make
+            # sure no filesystem of the group is still joinable before any
+            # of its MDS is restarted.
+            for fs in filesystems:
+                cur = self._fs_by_id(fs['id'])
+                if cur is not None and not (cur['mdsmap']['flags'] & CEPH_MDSMAP_NOT_JOINABLE):
+                    logger.info('Upgrade: fs %s is still joinable; failing it before the switch',
+                                cur['mdsmap']['fs_name'])
+                    self._staged_mds_fail_fs(cur['mdsmap']['fs_name'])
+            st['phase'] = 'switching'
+            self._save_upgrade_state()
+            errors = self.mgr.wait_async(self._staged_mds_switch_all(daemons, target_image))
+            if errors:
+                self._staged_mds_rollback(
+                    st, daemons, fs_names,
+                    'switch-staged failed on ' + ', '.join(f'{k} ({v})' for k, v in errors.items()))
+                return
+            st['phase'] = 'switched'
+            self._save_upgrade_state()
+            phase = 'switched'
+
+        if phase == 'switched':
+            self.upgrade_info_str = f'Waiting for the MDS of {", ".join(fs_names)} on {target_version}'
+            pre_gids = {k: int(v) for k, v in (st.get('pre_gids') or {}).items()}
+            ok, why = self._staged_mds_wait(
+                fscids, names, pre_gids, target_version,
+                int(self.mgr.upgrade_mds_staged_switch_timeout))
+            if not ok:
+                self._staged_mds_rollback(st, daemons, fs_names, why)
+                return
+            logger.info('Upgrade: all %d MDS of %s are standbys on %s; re-joining',
+                        len(names), ', '.join(fs_names), target_version)
+            # joinable, wait for the ranks, restore standby-replay
+            self._complete_mds_upgrade(fs_names=fs_names)
+            # cephadm's daemon cache still shows the old image for these
+            # hosts; refresh it now so the next pass moves on.
+            self.mgr.wait_async(self._staged_mds_refresh_hosts(hosts))
+            for fscid in fscids:
+                self._staged_mds_clear(fscid)
+            logger.info('Upgrade: filesystem(s) %s back on %s', ', '.join(fs_names), target_version)
+
+    async def _staged_mds_refresh_hosts(self, hosts: List[str]) -> None:
+        async def one(host: str) -> None:
+            try:
+                ls = await CephadmServe(self.mgr)._run_cephadm_json(
+                    host, 'mon', 'ls', [], no_fsid=True,
+                    log_output=self.mgr.log_refresh_metadata)
+                self.mgr._process_ls_output(host, ls)
+            except Exception as e:
+                logger.warning('Upgrade: refreshing daemons of %s failed: %s', host, e)
+                self.mgr.cache.invalidate_host_daemons(host)
+        await asyncio.gather(*[one(h) for h in hosts])
 
     def _prepare_for_mds_upgrade(
         self,
@@ -1915,6 +2422,14 @@ class CephadmUpgrade:
                 if finished_fs:
                     self._complete_mds_upgrade(fs_names=finished_fs)
                 need_upgrade = self._restrict_mds_need_upgrade_to_one_fs(need_upgrade)
+
+            # staged switch: stage, fail, switch in parallel, verify with
+            # the monitors, re-join - all in this pass, one filesystem
+            # (group) at a time. The next pass re-evaluates what is left.
+            if daemon_type == 'mds' and need_upgrade and self._staged_mds_enabled():
+                self._staged_mds_upgrade(
+                    [d_entry[0] for d_entry in need_upgrade], target_image, target_digests)
+                return
 
             # prepare filesystems for daemon upgrades?
             if (

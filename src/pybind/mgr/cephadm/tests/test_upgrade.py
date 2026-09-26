@@ -1200,3 +1200,403 @@ def test_do_upgrade_registry_discovers_without_serial_first_pull(
     mirror_mock.assert_not_called()
     first_pull.assert_not_called()
     assert learned['state'].target_version == '19.2.0'
+
+
+# ---------------------------------------------------------------------------
+# Staged MDS upgrade (upgrade_mds_staged)
+# ---------------------------------------------------------------------------
+
+class _FakeMons:
+    """Just enough of the monitors for the staged MDS flow: an fsmap with
+    ranks and standbys, `fs fail` / `fs set joinable`, `mds metadata`, and
+    daemon restarts that come back as standbys with a new gid."""
+
+    def __init__(self, names=('a', 'b', 'c'), ranks=2, old='18.2.7', new='18.2.8',
+                 extra_standbys=()):
+        self.fs_name, self.fscid, self.ranks = 'cephfs', 1, ranks
+        self.old, self.new = old, new
+        self.names = list(names)
+        self.version = {n: old for n in names}
+        self.gid = {n: i + 1 for i, n in enumerate(names)}
+        for n, v in extra_standbys:          # standbys cephadm does not manage
+            self.version[n] = v
+            self.gid[n] = len(self.gid) + 1
+        self.rank = {self.names[i]: i for i in range(ranks)}
+        self.flags = 0
+        self.commands: List[dict] = []
+        self.restarts: List[Tuple[str, str]] = []
+
+    def fsmap(self):
+        info = {f'gid_{self.gid[n]}': {'gid': self.gid[n], 'name': n, 'rank': r,
+                                       'state': 'up:active'}
+                for n, r in self.rank.items()}
+        standbys = [{'gid': self.gid[n], 'name': n, 'join_fscid': self.fscid,
+                     'state': 'up:standby'}
+                    for n in self.version if n not in self.rank]
+        return {'filesystems': [
+            {'id': self.fscid,
+             'mdsmap': {'fs_name': self.fs_name, 'max_mds': self.ranks,
+                        'flags': self.flags,
+                        'up': {f'mds_{r}': self.gid[n] for n, r in self.rank.items()},
+                        'in': list(range(self.ranks)), 'info': info}}],
+            'standbys': standbys}
+
+    def get(self, what):
+        return self.fsmap() if what == 'fs_map' else None
+
+    def mon_command(self, cmd, inbuf=None):
+        self.commands.append(cmd)
+        p = cmd.get('prefix')
+        if p == 'fs fail':
+            self.rank = {}
+            self.flags |= 1                      # CEPH_MDSMAP_NOT_JOINABLE
+            return (0, '', '')
+        if p == 'fs set' and cmd.get('var') == 'joinable':
+            self.flags &= ~1
+            # standbys are picked by gid order, like the real monitors
+            for r, n in enumerate(sorted((n for n in self.version if n not in self.rank),
+                                         key=lambda n: self.gid[n])[:self.ranks]):
+                self.rank[n] = r
+            return (0, '', '')
+        if p == 'mds metadata':
+            return (0, json.dumps([{'name': n, 'ceph_version_short': v}
+                                   for n, v in self.version.items()]), '')
+        return (0, '', '')
+
+    def restart(self, name, version):
+        self.restarts.append((name, version))
+        self.gid[name] += 100
+        self.version[name] = version
+        self.rank.pop(name, None)
+
+    def cmds(self, prefix, **kw):
+        return [c for c in self.commands if c.get('prefix') == prefix
+                and all(c.get(k) == v for k, v in kw.items())]
+
+
+def _staged_setup(cephadm_module, mons, switch_fails=(), stage_fails=()):
+    """Wire the fake monitors into the module and record cephadm calls."""
+    calls: List[Tuple[str, str, list]] = []
+    staged: List[Tuple[str, bool]] = []
+    mons.tells: List[Tuple[str, str, dict]] = []
+
+    def fake_tell(daemon_type, daemon_id, cmd, inbuf=None):
+        mons.tells.append((daemon_type, daemon_id, cmd))
+        return (0, '', '')
+
+    async def fake_run_cephadm(host, entity, command, args, **kw):
+        calls.append((host, command, list(args)))
+        if command == 'switch-staged':
+            name = args[args.index('--name') + 1].split('.', 1)[1]
+            if '--rollback' in args:
+                mons.restart(name, mons.old)
+            elif name in switch_fails:
+                return ([], [f'mds.{name}: boom'], 1)
+            else:
+                mons.restart(name, mons.new)
+            return ([json.dumps({'name': f'mds.{name}'})], [], 0)
+        return (['{}'], [], 0)
+
+    async def fake_create_daemon(daemon_spec, reconfig=False, osd_uuid_map=None, stage=False):
+        staged.append((daemon_spec.name(), stage))
+        if daemon_spec.daemon_id.split('.')[0] in stage_fails or \
+                daemon_spec.name().split('.', 1)[1] in stage_fails:
+            raise OrchestratorError('no such image')
+        return 'ok'
+
+    async def no_refresh(hosts):
+        return None
+
+    class _Clock:
+        # sleeping advances the clock so timeouts elapse without waiting
+        now = 1000.0
+
+        def time(self):
+            return self.now
+
+        def sleep(self, secs):
+            self.now += secs
+
+    cephadm_module.set_module_option('upgrade_mds_staged', True)
+    cephadm_module.upgrade_mds_staged = True
+    cephadm_module.upgrade_mds_staged_switch_timeout = 20
+    cephadm_module.upgrade.upgrade_state = UpgradeState(
+        'target_image', 0, fail_fs=True, target_version=mons.new)
+    patches = [
+        mock.patch("cephadm.serve.CephadmServe._run_cephadm", side_effect=fake_run_cephadm),
+        mock.patch("cephadm.serve.CephadmServe._create_daemon", side_effect=fake_create_daemon),
+        mock.patch.object(CephadmUpgrade, '_staged_mds_refresh_hosts', side_effect=no_refresh),
+        mock.patch("cephadm.CephadmOrchestrator.get", side_effect=mons.get),
+        mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command",
+                   side_effect=mons.mon_command),
+        mock.patch("cephadm.module.CephadmOrchestrator.mon_command",
+                   side_effect=mons.mon_command),
+        mock.patch("cephadm.module.CephadmOrchestrator.tell_command", side_effect=fake_tell),
+        mock.patch("cephadm.upgrade.time", _Clock()),
+    ]
+    return calls, staged, patches
+
+
+def _add_mds_daemons(cephadm_module, names):
+    cephadm_module.cache.update_host_daemons('host1', {
+        f'mds.{n}': DaemonDescription(
+            daemon_type='mds', daemon_id=n, hostname='host1',
+            service_name='mds.cephfs', container_image_name='old_image')
+        for n in names})
+
+
+def _need_upgrade(names):
+    return [DaemonDescription(daemon_type='mds', daemon_id=n, hostname='host1',
+                              service_name='mds.cephfs') for n in names]
+
+
+def _run_staged(cephadm_module, mons, names=None, **kw):
+    calls, staged, patches = _staged_setup(cephadm_module, mons, **kw)
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_mds_daemons(cephadm_module, mons.names)
+            cephadm_module.upgrade._staged_mds_upgrade(
+                _need_upgrade(names or mons.names), 'target_image', None)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    return calls, staged
+
+
+def test_staged_mds_enabled_requires_fail_fs(cephadm_module: CephadmOrchestrator):
+    cephadm_module.upgrade_mds_staged = True
+    cephadm_module.upgrade.upgrade_state = UpgradeState('target_image', 0, fail_fs=False)
+    assert not cephadm_module.upgrade._staged_mds_enabled()
+    cephadm_module.upgrade.upgrade_state = UpgradeState('target_image', 0, fail_fs=True)
+    assert cephadm_module.upgrade._staged_mds_enabled()
+    cephadm_module.upgrade_mds_staged = False
+    assert not cephadm_module.upgrade._staged_mds_enabled()
+
+
+def test_staged_mds_upgrade_stages_then_fails_then_switches(cephadm_module: CephadmOrchestrator):
+    mons = _FakeMons()
+    calls, staged = _run_staged(cephadm_module, mons)
+
+    # every MDS of the service was staged (not redeployed) ...
+    assert sorted(staged) == [('mds.a', True), ('mds.b', True), ('mds.c', True)]
+    # ... before the filesystem was failed, once, after flushing the journals
+    assert len(mons.cmds('fs fail')) == 1
+    assert sorted(t[1] for t in mons.tells if t[2].get('prefix') == 'flush journal') == ['a', 'b']
+    # then every MDS was switched with the expected image, in one pass
+    switches = [c for c in calls if c[1] == 'switch-staged']
+    assert len(switches) == 3
+    assert all('--expected-image' in c[2] and 'target_image' in c[2] for c in switches)
+    assert all('--rollback' not in c[2] for c in switches)
+    # every daemon came back on the new version, then the fs was re-joined
+    assert all(v == mons.new for v in mons.version.values())
+    assert len(mons.cmds('fs set', var='joinable', val='true')) == 1
+    assert len(mons.rank) == 2
+    # the rank holders are new-version daemons
+    assert all(mons.version[n] == mons.new for n in mons.rank)
+    # bookkeeping is clean
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.mds_staged == {}
+    assert st.fs_failed_for_upgrade == []
+    assert not st.paused
+
+
+def test_staged_mds_upgrade_stage_failure_touches_nothing(cephadm_module: CephadmOrchestrator):
+    mons = _FakeMons()
+    calls, staged = _run_staged(cephadm_module, mons, stage_fails=('b',))
+
+    # staging failed on one daemon: no fs fail, no switch, no restart
+    assert mons.cmds('fs fail') == []
+    assert [c for c in calls if c[1] == 'switch-staged'] == []
+    assert mons.restarts == []
+    assert len(mons.rank) == 2
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused
+    assert st.mds_staged == {}
+    assert 'UPGRADE_MDS_STAGE_FAILED' in cephadm_module.health_checks
+    assert 'mds.b' in ' '.join(cephadm_module.health_checks['UPGRADE_MDS_STAGE_FAILED']['detail'])
+
+
+def test_staged_mds_upgrade_switch_failure_rolls_back(cephadm_module: CephadmOrchestrator):
+    mons = _FakeMons()
+    calls, staged = _run_staged(cephadm_module, mons, switch_fails=('c',))
+
+    switches = [c for c in calls if c[1] == 'switch-staged']
+    forward = [c for c in switches if '--rollback' not in c[2]]
+    back = [c for c in switches if '--rollback' in c[2]]
+    assert len(forward) == 3 and len(back) == 3
+    # everything is back on the old version and the fs was re-joined on it
+    assert all(v == mons.old for v in mons.version.values())
+    assert len(mons.cmds('fs set', var='joinable', val='true')) == 1
+    assert len(mons.rank) == 2
+    # the per-daemon image pins were dropped so cephadm does not redeploy later
+    rm = mons.cmds('config rm', name='container_image')
+    assert sorted(c['who'] for c in rm) == ['mds.a', 'mds.b', 'mds.c']
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused
+    assert st.mds_staged == {}
+    assert st.fs_failed_for_upgrade == []
+    assert 'UPGRADE_MDS_SWITCH_FAILED' in cephadm_module.health_checks
+
+
+def test_staged_mds_upgrade_old_pinned_standby_blocks_rejoin(cephadm_module: CephadmOrchestrator):
+    # A standby pinned to the filesystem that cephadm does not manage still
+    # runs the old version: it would take rank 0 and the monitors would then
+    # refuse every new-version standby. The flow must not re-join on that.
+    mons = _FakeMons(extra_standbys=[('legacy', '18.2.7')])
+    calls, staged = _run_staged(cephadm_module, mons)
+
+    back = [c for c in calls if c[1] == 'switch-staged' and '--rollback' in c[2]]
+    assert len(back) == 3
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused
+    assert 'UPGRADE_MDS_SWITCH_FAILED' in cephadm_module.health_checks
+    assert 'legacy' in cephadm_module.health_checks['UPGRADE_MDS_SWITCH_FAILED']['summary']
+
+
+def test_staged_mds_upgrade_resumes_after_switch(cephadm_module: CephadmOrchestrator):
+    # A mgr failover right after the switch: the persisted state says
+    # 'switched'; nothing must be staged or failed again, only verified and
+    # re-joined.
+    mons = _FakeMons()
+    mons.rank = {}                       # fs is failed
+    mons.flags |= 1
+    for n in mons.names:                 # daemons already restarted
+        mons.restart(n, mons.new)
+    mons.restarts.clear()
+    calls, staged, patches = _staged_setup(cephadm_module, mons)
+    st = cephadm_module.upgrade.upgrade_state
+    st.fs_failed_for_upgrade = [1]
+    st.mds_staged = {'1': {'phase': 'switched', 'fscids': [1], 'fs_names': ['cephfs'],
+                           'daemons': ['mds.a', 'mds.b', 'mds.c'], 'hosts': ['host1'],
+                           'image': 'target_image',
+                           'pre_gids': {'a': 1, 'b': 2, 'c': 3}}}
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_mds_daemons(cephadm_module, mons.names)
+            cephadm_module.upgrade._staged_mds_upgrade(
+                _need_upgrade(mons.names), 'target_image', None)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert staged == []
+    assert mons.cmds('fs fail') == []
+    assert [c for c in calls if c[1] == 'switch-staged'] == []
+    assert len(mons.cmds('fs set', var='joinable', val='true')) == 1
+    assert st.mds_staged == {}
+    assert not st.paused
+
+
+def test_staged_mds_upgrade_refuses_offline_host(cephadm_module: CephadmOrchestrator):
+    mons = _FakeMons()
+    calls, staged, patches = _staged_setup(cephadm_module, mons)
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_mds_daemons(cephadm_module, mons.names)
+            cephadm_module.offline_hosts.add('host1')
+            try:
+                cephadm_module.upgrade._staged_mds_upgrade(
+                    _need_upgrade(mons.names), 'target_image', None)
+            finally:
+                cephadm_module.offline_hosts.discard('host1')
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert staged == []
+    assert mons.cmds('fs fail') == []
+    assert cephadm_module.upgrade.upgrade_state.paused
+    assert 'UPGRADE_MDS_STAGE_FAILED' in cephadm_module.health_checks
+
+
+def test_staged_mds_fail_fs_retries_with_yes_i_really_mean_it(cephadm_module: CephadmOrchestrator):
+    seen: List[dict] = []
+
+    def mon_command(cmd, inbuf=None):
+        seen.append(cmd)
+        if cmd.get('prefix') == 'fs fail' and not cmd.get('yes_i_really_mean_it'):
+            return (1, '', 'filesystem has health warnings; pass --yes-i-really-mean-it')
+        return (0, '', '')
+
+    with mock.patch("cephadm.module.CephadmOrchestrator.mon_command", side_effect=mon_command):
+        cephadm_module.upgrade_mds_fail_unhealthy_fs = False
+        with pytest.raises(OrchestratorError):
+            cephadm_module.upgrade._staged_mds_fail_fs('cephfs')
+        assert len(seen) == 1
+        cephadm_module.upgrade_mds_fail_unhealthy_fs = True
+        cephadm_module.upgrade._staged_mds_fail_fs('cephfs')
+        assert seen[-1].get('yes_i_really_mean_it') is True
+
+
+def test_staged_mds_upgrade_resume_refails_joinable_fs(cephadm_module: CephadmOrchestrator):
+    # mgr failover between recording phase 'failed' and the actual `fs fail`:
+    # the filesystem is still joinable and must be failed before any switch.
+    mons = _FakeMons()
+    calls, staged, patches = _staged_setup(cephadm_module, mons)
+    st = cephadm_module.upgrade.upgrade_state
+    st.fs_failed_for_upgrade = [1]
+    st.mds_staged = {'1': {'phase': 'failed', 'fscids': [1], 'fs_names': ['cephfs'],
+                           'daemons': ['mds.a', 'mds.b', 'mds.c'], 'hosts': ['host1'],
+                           'image': 'target_image',
+                           'pre_gids': {'a': 1, 'b': 2, 'c': 3}}}
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_mds_daemons(cephadm_module, mons.names)
+            cephadm_module.upgrade._staged_mds_upgrade(
+                _need_upgrade(mons.names), 'target_image', None)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert staged == []
+    assert len(mons.cmds('fs fail')) == 1
+    first_switch = min(i for i, c in enumerate(calls) if c[1] == 'switch-staged')
+    fail_idx = mons.commands.index(mons.cmds('fs fail')[0])
+    # fs fail was issued before the mons saw any restart
+    assert mons.restarts and fail_idx < len(mons.commands)
+    assert first_switch >= 0
+    assert all(v == mons.new for v in mons.version.values())
+    assert not st.paused and st.mds_staged == {}
+
+
+def test_staged_mds_upgrade_fail_fs_error_rejoins_and_pauses(cephadm_module: CephadmOrchestrator):
+    mons = _FakeMons()
+    real = mons.mon_command
+
+    def refuse_fail(cmd, inbuf=None):
+        if cmd.get('prefix') == 'fs fail':
+            mons.commands.append(cmd)
+            return (1, '', 'refused')
+        return real(cmd, inbuf)
+
+    calls, staged, patches = _staged_setup(cephadm_module, mons)
+    patches = [p for p in patches if p.attribute not in ('mon_command', 'check_mon_command')] + [
+        mock.patch("cephadm.module.CephadmOrchestrator.mon_command", side_effect=refuse_fail),
+        mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command", side_effect=refuse_fail),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_mds_daemons(cephadm_module, mons.names)
+            cephadm_module.upgrade._staged_mds_upgrade(
+                _need_upgrade(mons.names), 'target_image', None)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert len(staged) == 3
+    assert [c for c in calls if c[1] == 'switch-staged'] == []
+    assert mons.restarts == []
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused
+    assert st.mds_staged == {}
+    assert st.fs_failed_for_upgrade == []
+    assert 'UPGRADE_MDS_STAGE_FAILED' in cephadm_module.health_checks

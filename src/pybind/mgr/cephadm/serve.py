@@ -1294,7 +1294,14 @@ class CephadmServe:
                              daemon_spec: CephadmDaemonDeploySpec,
                              reconfig: bool = False,
                              osd_uuid_map: Optional[Dict[str, Any]] = None,
+                             stage: bool = False,
                              ) -> str:
+        """Deploy, reconfigure or - with stage=True - stage a daemon.
+
+        A staged deploy writes config, keyring and the new unit files
+        (as unit.*.staged) on the host without stopping or restarting the
+        daemon; `cephadm switch-staged` applies them later.
+        """
 
         daemon_params: Dict[str, Any] = {}
         with set_exception_subject('service', orchestrator.DaemonDescription(
@@ -1334,6 +1341,10 @@ class CephadmServe:
 
                 if reconfig:
                     daemon_params['reconfig'] = True
+                if stage:
+                    if reconfig:
+                        raise OrchestratorError('cannot stage a reconfig')
+                    daemon_params['stage'] = True
                 if self.mgr.allow_ptrace:
                     daemon_params['allow_ptrace'] = True
 
@@ -1349,7 +1360,7 @@ class CephadmServe:
                     await self._registry_login(daemon_spec.host, json.loads(str(self.mgr.get_store('registry_credentials'))))
 
                 self.log.info('%s daemon %s on %s' % (
-                    'Reconfiguring' if reconfig else 'Deploying',
+                    'Reconfiguring' if reconfig else ('Staging' if stage else 'Deploying'),
                     daemon_spec.name(), daemon_spec.host))
 
                 out, err, code = await self._run_cephadm(
@@ -1384,8 +1395,9 @@ class CephadmServe:
                     self.mgr.agent_cache.agent_timestamp[daemon_spec.host] = datetime_now()
                     self.mgr.agent_cache.agent_counter[daemon_spec.host] = 1
 
-                # refresh daemon state?  (ceph daemon reconfig does not need it)
-                if not reconfig or daemon_spec.daemon_type not in CEPH_TYPES:
+                # refresh daemon state?  (ceph daemon reconfig does not need it;
+                # a staged deploy leaves the daemon running as it was)
+                if not stage and (not reconfig or daemon_spec.daemon_type not in CEPH_TYPES):
                     if not code and daemon_spec.host in self.mgr.cache.daemons:
                         # prime cached service state with what we (should have)
                         # just created
@@ -1405,11 +1417,12 @@ class CephadmServe:
                         daemon_spec.host, daemon_spec.deps, start_time)
                     self.mgr.agent_cache.save_agent(daemon_spec.host)
                 msg = "{} {} on host '{}'".format(
-                    'Reconfigured' if reconfig else 'Deployed', daemon_spec.name(), daemon_spec.host)
+                    'Reconfigured' if reconfig else ('Staged' if stage else 'Deployed'),
+                    daemon_spec.name(), daemon_spec.host)
                 if not code:
                     self.mgr.events.for_daemon(daemon_spec.name(), OrchestratorEvent.INFO, msg)
                 else:
-                    what = 'reconfigure' if reconfig else 'deploy'
+                    what = 'reconfigure' if reconfig else ('stage' if stage else 'deploy')
                     self.mgr.events.for_daemon(
                         daemon_spec.name(), OrchestratorEvent.ERROR, f'Failed to {what}: {err}')
                 return msg

@@ -138,6 +138,67 @@ Starting the upgrade
 
       ceph config set mgr mgr/cephadm/upgrade_fs_one_at_a_time false
 
+   .. _cephadm-upgrade-mds-staged:
+
+   **Staged MDS switch (shorter outage with ``fail_fs``)**
+
+   With ``fail_fs = true`` the filesystem stays failed while cephadm redeploys
+   its MDS daemons one after the other. Most of each redeployment does not
+   need the filesystem to be down: cephadm only writes new unit files and
+   restarts a container. To keep the filesystem down for as little as one
+   container restart, enable the staged switch:
+
+   .. prompt:: bash #
+
+      ceph config set mgr mgr/orchestrator/fail_fs true
+      ceph config set mgr mgr/cephadm/upgrade_mds_staged true
+
+   For each filesystem, cephadm then:
+
+               #. *stages* the new deployment on every MDS host while the
+                  filesystem is still serving clients (new config, keyring
+                  and unit files written next to the live ones, target image
+                  pulled and executed once with ``--version``),
+
+               #. flushes the MDS journals, disables standby-replay and
+                  fails the filesystem,
+
+               #. switches every MDS daemon to its staged unit files, all
+                  hosts in parallel (one ``systemctl stop`` / ``start``
+                  each),
+
+               #. waits until the monitors report every daemon back as
+                  ``up:standby`` with the target version, and
+
+               #. sets the filesystem joinable again and restores
+                  standby-replay.
+
+   Anything that can go wrong with the image (pull, registry, uid lookup)
+   goes wrong in step 1, with the filesystem still up. If a daemon does not
+   come back on the target version in step 4, every daemon is switched back
+   to its previous unit files, the filesystem is re-joined on the previous
+   release and the upgrade is paused with an ``UPGRADE_MDS_SWITCH_FAILED``
+   warning.
+
+   Related options:
+
+   * ``mgr/cephadm/upgrade_mds_staged_switch_timeout`` (default ``120``
+     seconds): how long to wait in step 4 before rolling back.
+   * ``mgr/cephadm/upgrade_mds_staged_max_parallel`` (default ``16``): how
+     many hosts to stage or switch at once.
+   * ``mgr/cephadm/upgrade_mds_fail_unhealthy_fs`` (default ``false``): on
+     releases whose ``fs fail`` refuses a filesystem with MDS health
+     warnings, retry with ``--yes-i-really-mean-it``.
+
+   When a cluster has other standby MDS daemons pinned to the filesystem
+   (``mds_join_fs``) that cephadm does not manage, they must run the target
+   release before the filesystem is re-joined, or the monitors could hand a
+   rank to an older daemon and then refuse the upgraded ones. cephadm checks
+   this and rolls back rather than re-joining in that case. With several
+   filesystems, consider ``ceph fs set <fs> refuse_standby_for_another_fs
+   true`` so that standbys of one filesystem do not take ranks in another
+   while it is being upgraded.
+
 Before you use cephadm to upgrade Ceph, verify that all hosts are currently online and that your cluster is healthy by running the following command:
 
 .. prompt:: bash #
