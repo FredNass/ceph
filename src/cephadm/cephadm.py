@@ -2510,6 +2510,15 @@ def validate_fsid(func: FuncT) -> FuncT:
     return cast(FuncT, _validate_fsid)
 
 
+def _ctx_daemon_name(ctx: CephadmContext) -> Optional[str]:
+    """ctx.name as a single daemon name, or None when absent or when the
+    command named several daemons (switch-staged --name a --name b)."""
+    name = ctx.name if 'name' in ctx else None
+    if isinstance(name, list):
+        return name[0] if len(name) == 1 else None
+    return name or None
+
+
 def infer_fsid(func: FuncT) -> FuncT:
     """
     If we only find a single fsid in /var/lib/ceph/*, use that
@@ -2532,10 +2541,10 @@ def infer_fsid(func: FuncT) -> FuncT:
             if not is_fsid(daemon['fsid']):
                 # 'unknown' fsid
                 continue
-            elif 'name' not in ctx or not ctx.name:
-                # ctx.name not specified
+            elif not _ctx_daemon_name(ctx):
+                # ctx.name not specified (or several daemons named)
                 fsids.add(daemon['fsid'])
-            elif daemon['name'] == ctx.name:
+            elif daemon['name'] == _ctx_daemon_name(ctx):
                 # ctx.name is a match
                 fsids.add(daemon['fsid'])
         fsids = sorted(fsids)
@@ -2588,7 +2597,7 @@ def infer_config(func: FuncT) -> FuncT:
             return func(ctx)
 
         if 'fsid' in ctx and ctx.fsid:
-            name = ctx.name if ('name' in ctx and ctx.name) else get_mon_daemon_name(ctx.fsid)
+            name = _ctx_daemon_name(ctx) or get_mon_daemon_name(ctx.fsid)
             if name is not None:
                 # daemon name has been specified (or inferred from mon), let's use its conf
                 ctx.config = config_path(name.split('.', 1)[0], name.split('.', 1)[1])
@@ -2801,7 +2810,8 @@ def infer_local_ceph_image(ctx: CephadmContext, container_path: str) -> Optional
                              '--format', '{{.Repository}}@{{.Digest}}|{{.ID}}|{{.Tag}}|{{.CreatedAt}}'])
 
     container_info = None
-    daemon_name = ctx.name if ('name' in ctx and ctx.name and '.' in ctx.name) else None
+    daemon_name = _ctx_daemon_name(ctx)
+    daemon_name = daemon_name if (daemon_name and '.' in daemon_name) else None
     daemons_ls = [daemon_name] if daemon_name is not None else Ceph.daemons  # daemon types: 'mon', 'mgr', etc
     for daemon in daemons_ls:
         container_info = get_container_info(ctx, daemon, daemon_name is not None)
@@ -4156,7 +4166,7 @@ def verify_staged_image(ctx: CephadmContext, c: 'CephContainer') -> str:
     return version
 
 
-def switch_staged_unit_files(
+def _staged_switch_plan(
     ctx: CephadmContext,
     fsid: str,
     daemon_type: str,
@@ -4164,13 +4174,9 @@ def switch_staged_unit_files(
     expected_image: Optional[str] = None,
     rollback: bool = False,
 ) -> Dict[str, Any]:
-    """Swap the unit.*.staged files written by a staged deploy into place
-    (or, with rollback, put the unit.*.prev files back) and restart the
-    daemon. The whole downtime is the stop/start of the container.
-
-    Idempotent: calling it again after a successful switch (or rollback)
-    only makes sure the unit is running.
-    """
+    """Everything switch_staged_units() needs to know about one daemon,
+    checked *before* anything is stopped: which unit.* files are pending,
+    whether the staged image is the expected one and still present."""
     data_dir = get_data_dir(fsid, ctx.data_dir, daemon_type, daemon_id)
     if not os.path.isdir(data_dir):
         raise Error(f'{daemon_type}.{daemon_id}: data dir {data_dir} does not exist')
@@ -4188,13 +4194,22 @@ def switch_staged_unit_files(
             return None
 
     pending = [n for n in UNIT_FILES if os.path.exists(path(n, src_suffix))]
-    result: Dict[str, Any] = {
-        'name': f'{daemon_type}.{daemon_id}',
-        'rollback': rollback,
-        'switched': [],
-        'image': read_image(path('unit.image')),
+    plan: Dict[str, Any] = {
+        'fsid': fsid,
+        'daemon_name': f'{daemon_type}.{daemon_id}',
+        'unit_name': unit_name,
+        'path': path,
+        'read_image': read_image,
+        'pending': pending,
+        'src_suffix': src_suffix,
+        'dst_suffix': dst_suffix,
+        'result': {
+            'name': f'{daemon_type}.{daemon_id}',
+            'rollback': rollback,
+            'switched': [],
+            'image': read_image(path('unit.image')),
+        },
     }
-
     if not pending:
         # Nothing to swap: either already done (previous call succeeded but
         # the caller never heard back) or never staged. Distinguish by the
@@ -4204,13 +4219,7 @@ def switch_staged_unit_files(
             raise Error(f'{daemon_type}.{daemon_id}: nothing staged for '
                         f'{"rollback" if rollback else "switch"} and live image '
                         f'{live_image!r} is not the expected {expected_image!r}')
-        _, state, _ = check_unit(ctx, unit_name)
-        if state != 'running':
-            call(ctx, ['systemctl', 'reset-failed', unit_name], verbosity=CallVerbosity.DEBUG)
-            call_throws(ctx, ['systemctl', 'start', unit_name])
-            result['started'] = True
-        result['already_switched'] = True
-        return result
+        return plan
 
     if 'unit.run' not in pending:
         raise Error(f'{daemon_type}.{daemon_id}: unit.run{src_suffix} is missing, '
@@ -4228,24 +4237,79 @@ def switch_staged_unit_files(
         if code:
             raise Error(f'{daemon_type}.{daemon_id}: staged image {staged_image} '
                         f'is not present on this host')
+    return plan
 
-    # --- downtime window starts here
-    call_throws(ctx, ['systemctl', 'stop', unit_name])
-    for n in pending:
-        live = path(n)
-        if os.path.exists(live):
-            os.replace(live, path(n, dst_suffix))
-        os.replace(path(n, src_suffix), live)
-        result['switched'].append(n)
-    result['image'] = read_image(path('unit.image'))
-    clean_cgroup(ctx, fsid, unit_name)
-    call(ctx, ['systemctl', 'reset-failed', unit_name], verbosity=CallVerbosity.DEBUG)
-    call_throws(ctx, ['systemctl', 'enable', unit_name])
-    call_throws(ctx, ['systemctl', 'start', unit_name])
-    # --- downtime window ends here
-    logger.info('%s %s.%s: %s -> %s', 'Rolled back' if rollback else 'Switched',
-                daemon_type, daemon_id, ', '.join(result['switched']), result['image'])
-    return result
+
+def switch_staged_units(
+    ctx: CephadmContext,
+    fsid: str,
+    daemons: List[Tuple[str, Union[int, str]]],
+    expected_image: Optional[str] = None,
+    rollback: bool = False,
+) -> List[Dict[str, Any]]:
+    """Swap the unit.*.staged files written by a staged deploy into place
+    (or, with rollback, put the unit.*.prev files back) for every daemon
+    given ((type, id) pairs) and restart them, all together: one
+    ``systemctl stop`` of all the units, the file swaps, one ``systemctl
+    start``. The downtime of a host's daemons is the stop/start of their
+    containers, not a sequence of them - cephadm's per-host lock would
+    otherwise serialize one call per daemon.
+
+    Every check runs before anything is stopped; a daemon that fails one
+    fails the whole call with nothing restarted.
+
+    Idempotent: a daemon already switched (or rolled back) is only made
+    sure to be running.
+    """
+    if not daemons:
+        raise Error('no daemon to switch')
+    plans = [_staged_switch_plan(ctx, fsid, t, i, expected_image, rollback) for t, i in daemons]
+    to_swap = [p for p in plans if p['pending']]
+    done = [p for p in plans if not p['pending']]
+
+    for p in done:
+        _, state, _ = check_unit(ctx, p['unit_name'])
+        if state != 'running':
+            call(ctx, ['systemctl', 'reset-failed', p['unit_name']], verbosity=CallVerbosity.DEBUG)
+            call_throws(ctx, ['systemctl', 'start', p['unit_name']])
+            p['result']['started'] = True
+        p['result']['already_switched'] = True
+
+    if to_swap:
+        units = [p['unit_name'] for p in to_swap]
+        # --- downtime window starts here
+        call_throws(ctx, ['systemctl', 'stop'] + units)
+        for p in to_swap:
+            path, result = p['path'], p['result']
+            for n in p['pending']:
+                live = path(n)
+                if os.path.exists(live):
+                    os.replace(live, path(n, p['dst_suffix']))
+                os.replace(path(n, p['src_suffix']), live)
+                result['switched'].append(n)
+            result['image'] = p['read_image'](path('unit.image'))
+            clean_cgroup(ctx, p['fsid'], p['unit_name'])
+        call(ctx, ['systemctl', 'reset-failed'] + units, verbosity=CallVerbosity.DEBUG)
+        call_throws(ctx, ['systemctl', 'enable'] + units)
+        call_throws(ctx, ['systemctl', 'start'] + units)
+        # --- downtime window ends here
+        for p in to_swap:
+            logger.info('%s %s: %s -> %s', 'Rolled back' if rollback else 'Switched',
+                        p['daemon_name'], ', '.join(p['result']['switched']),
+                        p['result']['image'])
+    return [p['result'] for p in plans]
+
+
+def switch_staged_unit_files(
+    ctx: CephadmContext,
+    fsid: str,
+    daemon_type: str,
+    daemon_id: Union[int, str],
+    expected_image: Optional[str] = None,
+    rollback: bool = False,
+) -> Dict[str, Any]:
+    """switch_staged_units() for a single daemon."""
+    return switch_staged_units(ctx, fsid, [(daemon_type, daemon_id)], expected_image, rollback)[0]
 
 
 def deploy_daemon_units(
@@ -7410,18 +7474,23 @@ def command_switch_staged(ctx: CephadmContext) -> int:
     (or unit.*.prev) files into place and restart the daemon."""
     if not ctx.fsid:
         raise Error('must pass --fsid to specify cluster')
-    daemon_type, daemon_id = ctx.name.split('.', 1)
-    if daemon_type not in get_supported_daemons():
-        raise Error('daemon type %s not recognized' % daemon_type)
+    names = ctx.name if isinstance(ctx.name, list) else [ctx.name]
+    daemons: List[Tuple[str, Union[int, str]]] = []
+    for name in names:
+        daemon_type, daemon_id = name.split('.', 1)
+        if daemon_type not in get_supported_daemons():
+            raise Error('daemon type %s not recognized' % daemon_type)
+        daemons.append((daemon_type, daemon_id))
 
     lock = FileLock(ctx, ctx.fsid)
     lock.acquire()
-    result = switch_staged_unit_files(
-        ctx, ctx.fsid, daemon_type, daemon_id,
+    results = switch_staged_units(
+        ctx, ctx.fsid, daemons,
         expected_image=ctx.expected_image or None,
         rollback=ctx.rollback,
     )
-    print(json.dumps(result, indent=4))
+    # one --name: the daemon's result; several: the list, in --name order
+    print(json.dumps(results[0] if len(results) == 1 else results, indent=4))
     return 0
 
 ##################################
@@ -8808,6 +8877,19 @@ class CustomValidation(argparse.Action):
         if self.dest == 'name':
             self._check_name(values)
             setattr(namespace, self.dest, values)
+
+
+class CustomValidationAppend(CustomValidation):
+    """CustomValidation for an option that may be repeated: every value is
+    checked and the destination is the list of them, in order."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: Union[str, Sequence[Any], None],
+                 option_string: Optional[str] = None) -> None:
+        assert isinstance(values, str)
+        if self.dest == 'name':
+            self._check_name(values)
+            current = getattr(namespace, self.dest, None) or []
+            setattr(namespace, self.dest, list(current) + [values])
 
 ##################################
 
@@ -10741,8 +10823,9 @@ def _get_parser():
     parser_switch_staged.add_argument(
         '--name', '-n',
         required=True,
-        action=CustomValidation,
-        help='daemon name (type.id)')
+        action=CustomValidationAppend,
+        help='daemon name (type.id); may be given several times to switch '
+             'these daemons around one stop/start')
     parser_switch_staged.add_argument(
         '--expected-image',
         default='',
