@@ -2473,7 +2473,8 @@ class CephadmUpgrade:
             if need_upgrade:
                 policy = policy_for(self, daemon_type)
                 if policy and StagedSwitchRunner(self, policy).run(
-                        [d_entry[0] for d_entry in need_upgrade], target_image):
+                        [d_entry[0] for d_entry in need_upgrade], target_image,
+                        redeploy_only=[d_entry[0].name() for d_entry in need_upgrade if d_entry[1]]):
                     return
 
             # prepare filesystems for daemon upgrades?
