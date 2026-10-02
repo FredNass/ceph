@@ -514,6 +514,85 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                  're-joined and the upgrade is paused.'
         ),
         Option(
+            'upgrade_staged_switch',
+            type='bool',
+            default=False,
+            desc='During upgrade, for the daemon types listed in '
+                 'upgrade_staged_switch_types, stage the new deployment on every '
+                 'host while the daemons still serve, then take the group down, '
+                 'switch every daemon to the staged deployment in parallel, '
+                 'verify with the monitors and bring the group back. On reef the '
+                 'only policy is the OSD one (see upgrade_staged_switch_osd_*); '
+                 'the staged MDS switch is upgrade_mds_staged.'
+        ),
+        Option(
+            'upgrade_staged_switch_types',
+            type='str',
+            default='osd',
+            desc='Comma-separated daemon types the staged switch applies to. '
+                 'Only types with a staged switch policy are honoured (reef: osd).'
+        ),
+        Option(
+            'upgrade_staged_switch_timeout',
+            type='int',
+            default=120,
+            desc='Seconds to wait, after switching a group of daemons to the '
+                 'staged deployment, for the monitors to report every one of them '
+                 'back on the target version (policies may override it: see '
+                 'upgrade_staged_switch_osd_timeout).'
+        ),
+        Option(
+            'upgrade_staged_switch_max_parallel',
+            type='int',
+            default=16,
+            desc='Maximum number of hosts staged or switched concurrently by the '
+                 'staged switch.'
+        ),
+        Option(
+            'upgrade_staged_switch_osd_crush_level',
+            type='str',
+            default='host',
+            desc='With the staged switch for OSDs, the CRUSH bucket type whose OSDs '
+                 'are switched together: every OSD still to upgrade under one '
+                 'bucket of that type is staged, then restarted in one go, one '
+                 'bucket per pass, provided `osd ok-to-stop` on that exact set '
+                 'reports that every PG stays active. With `auto`, the highest '
+                 'bucket type below the root for which such a bucket exists is '
+                 'used, re-evaluated for every group (a rack that cannot go as a '
+                 'whole is done host by host).'
+        ),
+        Option(
+            'upgrade_staged_switch_osd_noout',
+            type='bool',
+            default=True,
+            desc='With the staged switch for OSDs, set the noout flag on the OSDs '
+                 'of the group (`osd set-group noout`) right before they are '
+                 'restarted and clear it once they are back, so a restart that '
+                 'outlasts mon_osd_down_out_interval does not mark them out.'
+        ),
+        Option(
+            'upgrade_staged_switch_osd_timeout',
+            type='int',
+            default=600,
+            desc='With the staged switch for OSDs, seconds to wait, after the '
+                 'OSDs of a group are switched, for the osdmap to show every one '
+                 'of them up again and `osd metadata` to report the target version. '
+                 'On timeout the upgrade is paused (UPGRADE_SWITCH_FAILED) with '
+                 'the OSDs left as they are - never switched back, a store the '
+                 'new release has opened is not reopened by the previous one - '
+                 'and `ceph orch upgrade resume` re-verifies the same group.'
+        ),
+        Option(
+            'upgrade_staged_switch_osd_max_group',
+            type='int',
+            default=0,
+            desc='With the staged switch for OSDs, the most OSDs a group may '
+                 'hold; a bucket with more OSDs still to upgrade is skipped (with '
+                 '`auto` as the level, the next level down is tried). 0 means no '
+                 'limit: a whole bucket, whatever its size, as long as every PG '
+                 'stays active.'
+        ),
+        Option(
             'upgrade_mds_fail_unhealthy_fs',
             type='bool',
             default=False,
@@ -653,6 +732,14 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.upgrade_mds_staged = False
             self.upgrade_mds_staged_max_parallel = 16
             self.upgrade_mds_staged_switch_timeout = 120
+            self.upgrade_staged_switch = False
+            self.upgrade_staged_switch_types = 'osd'
+            self.upgrade_staged_switch_timeout = 120
+            self.upgrade_staged_switch_max_parallel = 16
+            self.upgrade_staged_switch_osd_crush_level = 'host'
+            self.upgrade_staged_switch_osd_noout = True
+            self.upgrade_staged_switch_osd_timeout = 600
+            self.upgrade_staged_switch_osd_max_group = 0
             self.upgrade_mds_fail_unhealthy_fs = False
             self.upgrade_skip_order_check = False
             self.device_enhanced_scan = False

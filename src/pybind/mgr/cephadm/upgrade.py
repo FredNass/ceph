@@ -9,6 +9,7 @@ import orchestrator
 from cephadm.registry import Registry
 from cephadm.serve import CephadmServe
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
+from cephadm.staged_switch import StagedSwitchRunner, policy_for
 from cephadm.utils import ceph_release_to_major, name_to_config_section, CEPH_UPGRADE_ORDER, \
     CEPH_TYPES, CEPH_IMAGE_TYPES, NON_CEPH_IMAGE_TYPES, MONITORING_STACK_TYPES, GATEWAY_TYPES
 from cephadm.ssh import HostConnectionError
@@ -88,6 +89,7 @@ class UpgradeState:
                  remaining_count: Optional[int] = None,
                  image_mirror_done: bool = False,
                  mds_staged: Optional[Dict[str, Any]] = None,
+                 staged_switch: Optional[Dict[str, Any]] = None,
                  ):
         self._target_name: str = target_name  # Use CephadmUpgrade.target_image instead.
         self.progress_id: str = progress_id
@@ -117,6 +119,10 @@ class UpgradeState:
         # in the middle of one resumes it instead of leaving the filesystem
         # failed. Cleared once the filesystem is back.
         self.mds_staged: Dict[str, Any] = mds_staged or {}
+        # progress of the staged switch of the group currently being
+        # handled (see cephadm.staged_switch: OSDs), so a mgr failover
+        # resumes it
+        self.staged_switch: Dict[str, Any] = staged_switch or {}
 
     def to_json(self) -> dict:
         return {
@@ -138,6 +144,7 @@ class UpgradeState:
             'remaining_count': self.remaining_count,
             'image_mirror_done': self.image_mirror_done,
             'mds_staged': self.mds_staged,
+            'staged_switch': self.staged_switch,
         }
 
     @classmethod
@@ -162,6 +169,8 @@ class CephadmUpgrade:
         'UPGRADE_OFFLINE_HOST',
         'UPGRADE_MDS_STAGE_FAILED',
         'UPGRADE_MDS_SWITCH_FAILED',
+        'UPGRADE_STAGE_FAILED',
+        'UPGRADE_SWITCH_FAILED',
     ]
 
     def __init__(self, mgr: "CephadmOrchestrator"):
@@ -2436,6 +2445,17 @@ class CephadmUpgrade:
                 self._staged_mds_upgrade(
                     [d_entry[0] for d_entry in need_upgrade], target_image, target_digests)
                 return
+
+            # staged switch (mgr/cephadm/upgrade_staged_switch, OSDs on reef):
+            # stage the new deployment while the daemons serve, switch every
+            # OSD of a CRUSH bucket in parallel, verify with the monitors -
+            # one group per pass. The next pass re-evaluates what is left.
+            if need_upgrade:
+                policy = policy_for(self, daemon_type)
+                if policy and StagedSwitchRunner(self, policy).run(
+                        [d_entry[0] for d_entry in need_upgrade], target_image,
+                        redeploy_only=[d_entry[0].name() for d_entry in need_upgrade if d_entry[1]]):
+                    return
 
             # prepare filesystems for daemon upgrades?
             if (

@@ -1,0 +1,1127 @@
+"""Tests for the staged switch: the daemon-type agnostic runner (driven with
+a fake policy) and the OSD policy (driven with a small monitor simulator).
+Reef: the MDS staged switch is tested in test_upgrade.py."""
+
+import json
+from typing import Dict, List, Tuple
+from unittest import mock
+
+from cephadm import CephadmOrchestrator
+from cephadm.staged_switch import (
+    CrushTree,
+    OsdStagedSwitchPolicy,
+    StagedGroup,
+    StagedSwitchNotReady,
+    StagedSwitchPolicy,
+    StagedSwitchRunner,
+    policy_for,
+)
+from cephadm.upgrade import UpgradeState
+from orchestrator import DaemonDescription, OrchestratorError
+
+from .fixtures import with_host
+
+
+TARGET = 'quay.io/ceph/ceph@sha256:' + 'ab' * 32
+NEW, OLD = '19.2.9', '19.2.8'
+
+
+class _Clock:
+    # sleeping advances the clock so timeouts elapse without waiting
+    now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, secs):
+        self.now += secs
+
+
+def _names_in(args):
+    """the --name values of a switch-staged call (one call per host names
+    every daemon of the group on that host)"""
+    return [args[i + 1] for i, a in enumerate(args) if a == '--name']
+
+
+def _dd(daemon_type, daemon_id, host='host1', service_name=None):
+    return DaemonDescription(daemon_type=daemon_type, daemon_id=daemon_id, hostname=host,
+                             service_name=service_name or f'{daemon_type}.svc',
+                             container_image_name='old_image')
+
+
+def _add_daemons(cephadm_module, dds):
+    by_host: Dict[str, Dict[str, DaemonDescription]] = {}
+    for d in dds:
+        by_host.setdefault(d.hostname, {})[d.name()] = d
+    for host, dm in by_host.items():
+        cephadm_module.cache.update_host_daemons(host, dm)
+
+
+# ---------------------------------------------------------------------------
+# Generic runner, with a fake policy
+# ---------------------------------------------------------------------------
+
+class _FakeWorld:
+    """What a fake daemon type looks like to its policy: each daemon has a
+    'generation' that changes when it restarts, and a version."""
+
+    def __init__(self, names, old=OLD):
+        self.gen = {n: 1 for n in names}
+        self.version = {n: old for n in names}
+        self.down = False
+        self.switched: set = set()
+        self.log: List[str] = []
+
+
+class _FakePolicy(StagedSwitchPolicy):
+    daemon_type = 'osd'   # any type with a cephadm service will do
+
+    def __init__(self, upgrade, world, refuse=None):
+        super().__init__(upgrade)
+        self.world = world
+        self.refuse = refuse
+
+    def groups(self, need_upgrade):
+        if not need_upgrade:
+            return []
+        return [StagedGroup('g1', 'group one', list(need_upgrade), {'note': 'x'})]
+
+    def preconditions(self, group):
+        return self.refuse
+
+    def take_down(self, group):
+        self.world.log.append('take_down')
+        self.world.down = True
+
+    def is_down(self, group):
+        return self.world.down
+
+    def snapshot(self, group):
+        return {'gen': dict(self.world.gen)}
+
+    def verify(self, group, snapshot, target_version):
+        for n in group.names:
+            if self.world.gen[n] == snapshot['gen'].get(n):
+                return False, f'{n} not restarted'
+            if target_version and self.world.version[n] != target_version:
+                return False, f'{n} on {self.world.version[n]}'
+        return True, ''
+
+    def restore(self, group):
+        self.world.log.append('restore')
+        self.world.down = False
+
+
+def _runner_setup(cephadm_module, names, switch_fails=(), stage_fails=(), verify_fails=()):
+    world = _FakeWorld(names)
+    calls: List[Tuple[str, str, list]] = []
+    staged: List[str] = []
+
+    async def fake_run_cephadm(host, entity, command, args, **kw):
+        calls.append((host, command, list(args)))
+        if command == 'switch-staged':
+            names = _names_in(args)
+            # like the real command: a daemon that cannot be switched fails
+            # the call before anything on the host is stopped
+            bad = [n for n in names if n in switch_fails and '--rollback' not in args]
+            if bad:
+                return ([], [f'{bad[0]}: boom'], 1)
+            for name in names:
+                if '--rollback' in args:
+                    # like the real command: nothing to put back for a daemon
+                    # that was never switched, it is only made sure to run
+                    if name in world.switched:
+                        world.gen[name] += 1
+                        world.version[name] = OLD
+                        world.switched.discard(name)
+                else:
+                    world.gen[name] += 1
+                    world.switched.add(name)
+                    world.version[name] = NEW if name not in verify_fails else OLD
+            return ([json.dumps([{'name': n} for n in names])], [], 0)
+        return (['{}'], [], 0)
+
+    async def fake_create_daemon(daemon_spec, reconfig=False, osd_uuid_map=None,
+                                 skip_restart_for_reconfig=False, send_signal_to_daemon=None,
+                                 stage=False):
+        assert stage is True
+        staged.append(daemon_spec.name())
+        if daemon_spec.name() in stage_fails:
+            raise OrchestratorError('no such image')
+        return 'ok'
+
+    async def no_refresh(hosts):
+        return None
+
+    def mon_command(cmd, inbuf=None):
+        # only the image pins matter here; staging an OSD also generates
+        # its config (auth get, config generate-minimal-conf)
+        if cmd.get('prefix') in ('config set', 'config rm'):
+            world.log.append(f"mon:{cmd.get('prefix')}:{cmd.get('who', '')}")
+        return (0, '', '')
+
+    cephadm_module.upgrade_staged_switch = True
+    cephadm_module.upgrade_staged_switch_timeout = 20
+    cephadm_module.upgrade.upgrade_state = UpgradeState(
+        'target_image', 0, target_digests=[TARGET], target_version=NEW, fail_fs=True)
+    patches = [
+        mock.patch("cephadm.serve.CephadmServe._run_cephadm", side_effect=fake_run_cephadm),
+        mock.patch("cephadm.serve.CephadmServe._create_daemon", side_effect=fake_create_daemon),
+        mock.patch.object(StagedSwitchRunner, '_refresh_hosts', side_effect=no_refresh),
+        mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command", side_effect=mon_command),
+        mock.patch("cephadm.staged_switch.time", _Clock()),
+    ]
+    return world, calls, staged, patches
+
+
+def _run_fake(cephadm_module, names=('a', 'b', 'c'), refuse=None, state=None, **kw):
+    dds = [_dd('osd', n) for n in names]
+    world, calls, staged, patches = _runner_setup(cephadm_module, [d.name() for d in dds], **kw)
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            if state:
+                cephadm_module.upgrade.upgrade_state.staged_switch = state
+            policy = _FakePolicy(cephadm_module.upgrade, world, refuse)
+            handled = StagedSwitchRunner(cephadm_module.upgrade, policy).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    return world, calls, staged, handled
+
+
+def _switches(calls, rollback=False):
+    """one entry per daemon switched (host, command, args, name)"""
+    return [(c[0], c[1], c[2], n) for c in calls if c[1] == 'switch-staged'
+            and (('--rollback' in c[2]) == rollback) for n in _names_in(c[2])]
+
+
+def _all_switches(calls):
+    return [c for c in calls if c[1] == 'switch-staged']
+
+
+def test_runner_happy_path(cephadm_module: CephadmOrchestrator):
+    world, calls, staged, handled = _run_fake(cephadm_module)
+    assert handled is True
+    # every daemon staged, then the group taken down, then every daemon switched
+    assert sorted(staged) == ['osd.a', 'osd.b', 'osd.c']
+    assert [e for e in world.log if not e.startswith('mon:')] == ['take_down', 'restore']
+    fwd = _switches(calls)
+    assert len(fwd) == 3
+    assert all('--expected-image' in c[2] and TARGET in c[2] for c in fwd)
+    assert _switches(calls, rollback=True) == []
+    assert all(v == NEW for v in world.version.values())
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.staged_switch == {}
+    assert not st.paused
+
+
+def test_runner_nothing_to_handle_falls_through(cephadm_module: CephadmOrchestrator):
+    world, calls, staged, handled = _run_fake(cephadm_module, names=())
+    assert handled is False
+    assert staged == [] and _all_switches(calls) == []
+
+
+def test_runner_precondition_pauses_before_staging(cephadm_module: CephadmOrchestrator):
+    world, calls, staged, handled = _run_fake(cephadm_module, refuse='not today')
+    assert handled is True
+    assert staged == [] and _all_switches(calls) == []
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused and st.staged_switch == {}
+    assert 'not today' in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+
+
+def test_runner_offline_host_pauses_before_staging(cephadm_module: CephadmOrchestrator):
+    dds = [_dd('osd', 'a')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a'])
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            cephadm_module.offline_hosts.add('host1')
+            try:
+                handled = StagedSwitchRunner(cephadm_module.upgrade,
+                                             _FakePolicy(cephadm_module.upgrade, world)).run(dds, TARGET)
+            finally:
+                cephadm_module.offline_hosts.discard('host1')
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert handled is True and staged == []
+    assert 'offline' in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+
+
+def test_runner_stage_failure_touches_nothing(cephadm_module: CephadmOrchestrator):
+    world, calls, staged, handled = _run_fake(cephadm_module, stage_fails=('osd.b',))
+    assert 'take_down' not in world.log       # never taken down
+    assert _switches(calls) == []
+    assert all(g == 1 for g in world.gen.values())
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused and st.staged_switch == {}
+    assert 'osd.b' in ' '.join(cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['detail'])
+
+
+def test_runner_take_down_failure_restores_and_pauses(cephadm_module: CephadmOrchestrator):
+    dds = [_dd('osd', 'a')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a'])
+
+    class _Refusing(_FakePolicy):
+        def take_down(self, group):
+            self.world.log.append('take_down')
+            raise OrchestratorError('fs fail refused')
+
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            StagedSwitchRunner(cephadm_module.upgrade, _Refusing(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert staged == ['osd.a']
+    assert [e for e in world.log if not e.startswith('mon:')] == ['take_down', 'restore']
+    assert _switches(calls) == []
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused and st.staged_switch == {}
+    assert 'fs fail refused' in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+
+
+def test_runner_switch_failure_rolls_back(cephadm_module: CephadmOrchestrator):
+    world, calls, staged, handled = _run_fake(cephadm_module, switch_fails=('osd.c',))
+    assert len(_switches(calls)) == 3
+    assert len(_switches(calls, rollback=True)) == 3
+    assert all(v == OLD for v in world.version.values())
+    # restored on the old release, after the per-daemon image pins were dropped
+    assert [e for e in world.log if not e.startswith('mon:config set')] == [
+        'take_down',
+        'mon:config rm:osd.a', 'mon:config rm:osd.b', 'mon:config rm:osd.c',
+        'restore']
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused and st.staged_switch == {}
+    assert 'UPGRADE_SWITCH_FAILED' in cephadm_module.health_checks
+
+
+def test_runner_rollback_after_partial_switch_across_hosts(cephadm_module: CephadmOrchestrator):
+    # host1 switched, host2's call failed before stopping anything: the
+    # rollback restarts host1's daemon only; host2's never re-registers and
+    # must not be waited for - the group is restored, not "left out of service"
+    dds = [_dd('osd', 'a', host='host1'), _dd('osd', 'b', host='host2')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a', 'osd.b'], switch_fails=('osd.b',))
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'), with_host(cephadm_module, 'host2'):
+            _add_daemons(cephadm_module, dds)
+            StagedSwitchRunner(cephadm_module.upgrade, _FakePolicy(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert sorted(n for _, _, _, n in _switches(calls, rollback=True)) == ['osd.a', 'osd.b']
+    assert world.gen == {'osd.a': 3, 'osd.b': 1} and all(v == OLD for v in world.version.values())
+    assert [e for e in world.log if not e.startswith('mon:')] == ['take_down', 'restore']
+    hc = cephadm_module.health_checks['UPGRADE_SWITCH_FAILED']
+    assert 'rolled back and restored' in hc['summary'] and 'after rollback' not in ' '.join(hc['detail'])
+
+
+def test_runner_verify_timeout_rolls_back(cephadm_module: CephadmOrchestrator):
+    # every switch "succeeds" but osd.b comes back on the old version
+    world, calls, staged, handled = _run_fake(cephadm_module, verify_fails=('osd.b',))
+    assert len(_switches(calls, rollback=True)) == 3
+    assert [e for e in world.log if not e.startswith('mon:')] == ['take_down', 'restore']
+    assert 'osd.b' in cephadm_module.health_checks['UPGRADE_SWITCH_FAILED']['summary']
+
+
+def test_runner_resumes_after_switch(cephadm_module: CephadmOrchestrator):
+    # mgr failover right after the switch: the persisted state says
+    # 'switched'; nothing must be staged, taken down or switched again,
+    # only verified and restored.
+    names = ['osd.a', 'osd.b']
+    state = {'type': 'osd', 'key': 'g1', 'label': 'group one', 'daemons': names,
+             'hosts': ['host1'], 'image': TARGET, 'data': {'note': 'x'},
+             'snapshot': {'gen': {n: 1 for n in names}}, 'phase': 'switched'}
+    dds = [_dd('osd', 'a'), _dd('osd', 'b')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, names)
+    world.down = True
+    for n in names:          # already restarted on the new version
+        world.gen[n] = 2
+        world.version[n] = NEW
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            cephadm_module.upgrade.upgrade_state.staged_switch = state
+            StagedSwitchRunner(cephadm_module.upgrade, _FakePolicy(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert staged == [] and _all_switches(calls) == []
+    assert [e for e in world.log if not e.startswith('mon:')] == ['restore']
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.staged_switch == {} and not st.paused
+
+
+def test_runner_resume_takes_down_again_if_needed(cephadm_module: CephadmOrchestrator):
+    # failover between recording 'down' and the actual take-down: the
+    # group is found up again and must be taken down before any switch
+    names = ['osd.a']
+    state = {'type': 'osd', 'key': 'g1', 'label': 'group one', 'daemons': names,
+             'hosts': ['host1'], 'image': TARGET, 'data': {},
+             'snapshot': {'gen': {'osd.a': 1}}, 'phase': 'down'}
+    world, calls, staged, handled = _run_fake(cephadm_module, names=('a',), state=state)
+    assert staged == []
+    assert [e for e in world.log if not e.startswith('mon:')] == ['take_down', 'restore']
+    assert len(_switches(calls)) == 1
+    assert not cephadm_module.upgrade.upgrade_state.paused
+
+
+def test_runner_not_ready_from_groups_waits_without_pausing(cephadm_module: CephadmOrchestrator):
+    dds = [_dd('osd', 'a')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a'])
+
+    class _Waiting(_FakePolicy):
+        def groups(self, need_upgrade):
+            raise StagedSwitchNotReady('PGs recovering')
+
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            handled = StagedSwitchRunner(cephadm_module.upgrade, _Waiting(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    # handled (the regular path must not take over), nothing staged, not paused
+    assert handled is True and staged == [] and _all_switches(calls) == []
+    st = cephadm_module.upgrade.upgrade_state
+    assert not st.paused and st.staged_switch == {}
+    assert 'UPGRADE_STAGE_FAILED' not in cephadm_module.health_checks
+    assert 'PGs recovering' in cephadm_module.upgrade.upgrade_info_str
+
+
+def test_runner_not_ready_at_take_down_starts_over(cephadm_module: CephadmOrchestrator):
+    # staged, but the policy cannot take the group down any more: the
+    # staged files are left behind, the image pins dropped, the state
+    # cleared, and the upgrade keeps running (next pass picks again)
+    dds = [_dd('osd', 'a'), _dd('osd', 'b')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a', 'osd.b'])
+
+    class _Changed(_FakePolicy):
+        def take_down(self, group):
+            self.world.log.append('take_down')
+            raise StagedSwitchNotReady('no longer ok-to-stop')
+
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            handled = StagedSwitchRunner(cephadm_module.upgrade, _Changed(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert handled is True
+    assert sorted(staged) == ['osd.a', 'osd.b'] and _all_switches(calls) == []
+    assert [e for e in world.log if not e.startswith('mon:config set')] == [
+        'take_down', 'mon:config rm:osd.a', 'mon:config rm:osd.b']   # no restore: nothing was taken down
+    st = cephadm_module.upgrade.upgrade_state
+    assert not st.paused and st.staged_switch == {}
+    assert 'no longer ok-to-stop' in cephadm_module.upgrade.upgrade_info_str
+
+
+def test_runner_config_error_pauses(cephadm_module: CephadmOrchestrator):
+    dds = [_dd('osd', 'a')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, ['osd.a'])
+
+    class _Misconfigured(_FakePolicy):
+        def groups(self, need_upgrade):
+            raise OrchestratorError('no such CRUSH bucket type')
+
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            handled = StagedSwitchRunner(cephadm_module.upgrade, _Misconfigured(cephadm_module.upgrade, world)).run(dds, TARGET)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    assert handled is True and staged == []
+    st = cephadm_module.upgrade.upgrade_state
+    assert st.paused
+    assert 'no such CRUSH bucket type' in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+
+
+def test_runner_counts_switched_daemons_against_limit(cephadm_module: CephadmOrchestrator):
+    dds = [_dd('osd', 'a'), _dd('osd', 'b'), _dd('osd', 'c')]
+    world, calls, staged, patches = _runner_setup(cephadm_module, [d.name() for d in dds])
+    for p in patches:
+        p.start()
+    try:
+        with with_host(cephadm_module, 'host1'):
+            _add_daemons(cephadm_module, dds)
+            st = cephadm_module.upgrade.upgrade_state
+            st.total_count, st.remaining_count = 10, 10
+            # osd.c is already on the target image and only redeployed: not counted
+            StagedSwitchRunner(cephadm_module.upgrade, _FakePolicy(cephadm_module.upgrade, world)).run(
+                dds, TARGET, redeploy_only=['osd.c'])
+            assert st.remaining_count == 8
+            # --limit reached: the runner steps aside
+            st.remaining_count = 0
+            handled = StagedSwitchRunner(cephadm_module.upgrade, _FakePolicy(cephadm_module.upgrade, world)).run(dds, TARGET)
+            assert handled is False
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+
+def test_runner_state_survives_json(cephadm_module: CephadmOrchestrator):
+    st = UpgradeState('t', 'pid', staged_switch={'type': 'mds', 'phase': 'down', 'data': {'fscids': [1]}})
+    restored = UpgradeState.from_json(json.loads(json.dumps(st.to_json())))
+    assert restored and restored.staged_switch == {'type': 'mds', 'phase': 'down', 'data': {'fscids': [1]}}
+    assert UpgradeState('t', 'pid').staged_switch == {}
+
+
+def test_policy_for_honours_options(cephadm_module: CephadmOrchestrator):
+    up = cephadm_module.upgrade
+    up.upgrade_state = UpgradeState('t', 'pid', fail_fs=True)
+    cephadm_module.upgrade_staged_switch = False
+    assert policy_for(up, 'osd') is None
+    cephadm_module.upgrade_staged_switch = True
+    cephadm_module.upgrade_staged_switch_types = 'osd'
+    assert isinstance(policy_for(up, 'osd'), OsdStagedSwitchPolicy)
+    cephadm_module.upgrade_staged_switch_types = 'mds'
+    assert policy_for(up, 'osd') is None                    # not listed
+    assert policy_for(up, 'mds') is None                    # reef: MDS go through _staged_mds_upgrade
+    cephadm_module.upgrade_staged_switch_types = 'osd, rgw'
+    assert policy_for(up, 'rgw') is None                    # listed, no policy
+    assert isinstance(policy_for(up, 'osd'), OsdStagedSwitchPolicy)
+
+
+# ---------------------------------------------------------------------------
+# OSD policy, with a monitor simulator (CRUSH tree, osdmap, PGs)
+# ---------------------------------------------------------------------------
+
+class _FakeOsdMons:
+    """Just enough of the monitors for the OSD policy: a CRUSH tree, an
+    osdmap with up / up_from / per-OSD flags, `osd ok-to-stop` evaluated
+    against a small PG model (acting sets and min_size; an OSD that just
+    restarted has no complete copy until recover() is called), `osd
+    set-group` / `unset-group`, and `osd metadata`.
+
+    Default topology: root default -> racks r1, r2, r3 -> two hosts each
+    (h1..h6) -> two OSDs each (0..11).
+    """
+
+    def __init__(self, old=OLD, new=NEW, pgs=None):
+        self.old, self.new = old, new
+        self.racks = {'r1': ['h1', 'h2'], 'r2': ['h3', 'h4'], 'r3': ['h5', 'h6']}
+        self.hosts = {h: [2 * i, 2 * i + 1] for i, h in enumerate(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])}
+        self.host_of = {o: h for h, osds in self.hosts.items() for o in osds}
+        self.epoch = 100
+        self.up = {o: True for o in range(12)}
+        self.up_from = {o: 10 for o in range(12)}
+        self.flags = {o: set() for o in range(12)}
+        self.version = {o: old for o in range(12)}
+        self.recovering = set()
+        # (min_size, acting): one replica per rack for most PGs, plus a
+        # "host failure domain" pool whose PGs put two replicas in r1
+        self.pgs = pgs if pgs is not None else (
+            [(2, [a, b, c]) for a in (0, 1, 2, 3) for b in (4, 5, 6, 7) for c in (8, 9, 10, 11)][:16]
+            + [(2, [0, 2, 4]), (2, [1, 3, 8])])
+        self.commands: List[dict] = []
+        self.restarts: List[Tuple[int, str]] = []
+
+    # --- maps
+    def tree(self):
+        nodes = [{'id': -1, 'name': 'default', 'type': 'root', 'type_id': 11, 'children': [-2, -3, -4]}]
+        rid, hid = -2, -10
+        for r, hosts in self.racks.items():
+            hids = []
+            for h in hosts:
+                hids.append(hid)
+                nodes.append({'id': hid, 'name': h, 'type': 'host', 'type_id': 1,
+                              'children': list(self.hosts[h])})
+                hid -= 1
+            nodes.append({'id': rid, 'name': r, 'type': 'rack', 'type_id': 3, 'children': hids})
+            rid -= 1
+        for o in range(12):
+            nodes.append({'id': o, 'name': f'osd.{o}', 'type': 'osd', 'type_id': 0, 'status': 'up'})
+        return {'nodes': nodes, 'stray': []}
+
+    def osdmap(self):
+        return {'epoch': self.epoch, 'osds': [
+            {'osd': o, 'uuid': f'uuid-{o}', 'up': 1 if self.up[o] else 0, 'in': 1,
+             'up_from': self.up_from[o], 'state': ['exists', 'up'] + sorted(self.flags[o])}
+            for o in range(12)]}
+
+    def get(self, what):
+        if what == 'osd_map':
+            return self.osdmap()
+        if what == 'osd_map_tree':
+            return self.tree()
+        return None
+
+    # --- the PG model behind ok-to-stop
+    def ok_to_stop(self, ids):
+        stopped = set(ids)
+        bad = []
+        for n, (min_size, acting) in enumerate(self.pgs):
+            if not stopped & set(acting):
+                continue
+            left = [o for o in acting if o not in stopped and o not in self.recovering and self.up[o]]
+            if len(left) < min_size:
+                bad.append(n)
+        return bad
+
+    def mon_command(self, cmd, inbuf=None):
+        self.commands.append(cmd)
+        p = cmd.get('prefix')
+        if p == 'osd ok-to-stop':
+            ids = [int(i) for i in cmd['ids']]
+            bad = self.ok_to_stop(ids)
+            report = {'ok_to_stop': not bad, 'osds': ids, 'bad_become_inactive': [f'1.{b}' for b in bad]}
+            if bad:
+                return (-16, json.dumps({'ok_to_stop': report}),
+                        f'unsafe to stop osd(s) at this time ({len(bad)} PGs are or would become offline)')
+            return (0, json.dumps({'ok_to_stop': report}), '')
+        if p in ('osd set-group', 'osd unset-group'):
+            for who in cmd['who']:
+                o = int(who.split('.', 1)[1])
+                for fl in cmd['flags'].split(','):
+                    (self.flags[o].add if p == 'osd set-group' else self.flags[o].discard)(fl)
+            return (0, '', '')
+        if p == 'osd metadata':
+            o = int(cmd['id'])
+            return (0, json.dumps({'id': o, 'ceph_version_short': self.version[o],
+                                   'ceph_version': f'ceph version {self.version[o]} (hash) x (stable)'}), '')
+        if p == 'versions':
+            return (0, '{}', '')
+        return (0, '', '')
+
+    # --- what cephadm switch-staged does to the world
+    def restart(self, osd_id, version, comes_back=True):
+        self.restarts.append((osd_id, version))
+        self.epoch += 1
+        self.version[osd_id] = version
+        if comes_back:
+            self.up[osd_id] = True
+            self.up_from[osd_id] = self.epoch
+            self.recovering.add(osd_id)
+        else:
+            self.up[osd_id] = False
+
+    def recover(self):
+        self.recovering.clear()
+
+    def cmds(self, prefix, **kw):
+        return [c for c in self.commands if c.get('prefix') == prefix
+                and all(c.get(k) == v for k, v in kw.items())]
+
+
+def _osd_dds(mons, ids=None):
+    return [_dd('osd', str(o), host=mons.host_of[o], service_name='osd.all')
+            for o in (ids if ids is not None else range(12))]
+
+
+def _osd_setup(cephadm_module, mons, switch_fails=(), never_up=(), level='host', noout=True):
+    calls: List[Tuple[str, str, list]] = []
+    staged: List[str] = []
+
+    async def fake_run_cephadm(host, entity, command, args, **kw):
+        calls.append((host, command, list(args)))
+        if command == 'switch-staged':
+            ids = [int(n.split('.', 1)[1]) for n in _names_in(args)]
+            bad = [i for i in ids if i in switch_fails and '--rollback' not in args]
+            if bad:
+                return ([], [f'osd.{bad[0]}: boom'], 1)
+            for osd_id in ids:
+                if '--rollback' in args:
+                    mons.restart(osd_id, mons.old)
+                else:
+                    mons.restart(osd_id, mons.new, comes_back=osd_id not in never_up)
+            return ([json.dumps([{'name': f'osd.{i}'} for i in ids])], [], 0)
+        return (['{}'], [], 0)
+
+    async def fake_create_daemon(daemon_spec, reconfig=False, osd_uuid_map=None,
+                                 skip_restart_for_reconfig=False, send_signal_to_daemon=None,
+                                 stage=False):
+        assert stage is True
+        assert osd_uuid_map and osd_uuid_map[daemon_spec.daemon_id] == f'uuid-{daemon_spec.daemon_id}'
+        staged.append(daemon_spec.name())
+        return 'ok'
+
+    async def no_refresh(hosts):
+        return None
+
+    cephadm_module.upgrade_staged_switch = True
+    cephadm_module.upgrade_staged_switch_types = 'osd'
+    cephadm_module.upgrade_staged_switch_timeout = 20
+    cephadm_module.upgrade_staged_switch_osd_crush_level = level
+    cephadm_module.upgrade_staged_switch_osd_noout = noout
+    cephadm_module.upgrade.upgrade_state = UpgradeState(
+        'target_image', 0, target_digests=[TARGET], target_version=mons.new)
+    patches = [
+        mock.patch("cephadm.serve.CephadmServe._run_cephadm", side_effect=fake_run_cephadm),
+        mock.patch("cephadm.serve.CephadmServe._create_daemon", side_effect=fake_create_daemon),
+        mock.patch.object(StagedSwitchRunner, '_refresh_hosts', side_effect=no_refresh),
+        mock.patch("cephadm.CephadmOrchestrator.get", side_effect=mons.get),
+        mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command", side_effect=mons.mon_command),
+        mock.patch("cephadm.module.CephadmOrchestrator.mon_command", side_effect=mons.mon_command),
+        mock.patch("cephadm.staged_switch.time", _Clock()),
+    ]
+    return calls, staged, patches
+
+
+class _OsdRun:
+    """Drives passes of the OSD policy against the simulator: each pass
+    hands the runner the OSDs still on the old version, like _do_upgrade."""
+
+    def __init__(self, cephadm_module, mons, dds=None, **kw):
+        self.m, self.mons = cephadm_module, mons
+        self.dds = dds if dds is not None else _osd_dds(mons)
+        self.calls, self.staged, self.patches = _osd_setup(cephadm_module, mons, **kw)
+        self.groups: List[str] = []
+
+    def __enter__(self):
+        for p in self.patches:
+            p.start()
+        self.hosts = [with_host(self.m, h) for h in self.mons.hosts]
+        for h in self.hosts:
+            h.__enter__()
+        _add_daemons(self.m, self.dds)
+        return self
+
+    def __exit__(self, *exc):
+        for h in reversed(self.hosts):
+            h.__exit__(*exc)
+        for p in reversed(self.patches):
+            p.stop()
+
+    def pending(self):
+        return [d for d in self.dds if self.mons.version[int(d.daemon_id)] != self.mons.new]
+
+    def one_pass(self, dds=None):
+        policy = policy_for(self.m.upgrade, 'osd')
+        assert isinstance(policy, OsdStagedSwitchPolicy)
+        before = len(self.mons.restarts)
+        handled = StagedSwitchRunner(self.m.upgrade, policy).run(
+            dds if dds is not None else self.pending(), TARGET)
+        self.groups.append(sorted(o for o, _ in self.mons.restarts[before:]))
+        return handled
+
+    def switched(self, rollback=False):
+        return _switches(self.calls, rollback)
+
+
+def test_crush_tree_view():
+    tree = CrushTree(_FakeOsdMons().tree())
+    assert tree.roots == [-1]
+    assert tree.osds_under(-1) == list(range(12))
+    assert tree.osds_under(-2) == [0, 1, 2, 3]            # r1
+    assert tree.osds_under(-10) == [0, 1]                 # h1
+    assert [b['name'] for b in tree.buckets_of_type('rack')] == ['r1', 'r2', 'r3']
+    assert tree.bucket_types_top_down() == ['rack', 'host']   # not 'root'
+    assert tree.by_name['h3']['id'] == -12
+    # natural order: host2 before host10
+    t2 = CrushTree({'nodes': [{'id': -1, 'name': 'root', 'type': 'root', 'type_id': 11, 'children': [-2, -3]},
+                              {'id': -2, 'name': 'host10', 'type': 'host', 'type_id': 1, 'children': [0]},
+                              {'id': -3, 'name': 'host2', 'type': 'host', 'type_id': 1, 'children': [1]},
+                              {'id': 0, 'name': 'osd.0', 'type': 'osd', 'type_id': 0},
+                              {'id': 1, 'name': 'osd.1', 'type': 'osd', 'type_id': 0}]})
+    assert [b['name'] for b in t2.buckets_of_type('host')] == ['host2', 'host10']
+
+
+def test_osd_host_level_one_host_per_pass(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        assert run.one_pass() is True
+        # the whole of h1 staged, noout set on exactly those OSDs, both
+        # switched at once, noout cleared, versions checked with the monitors
+        assert sorted(run.staged) == ['osd.0', 'osd.1']
+        assert run.groups[-1] == [0, 1]
+        assert mons.cmds('osd set-group') == [{'prefix': 'osd set-group', 'flags': 'noout', 'who': ['osd.0', 'osd.1']}]
+        assert mons.cmds('osd unset-group') == [{'prefix': 'osd unset-group', 'flags': 'noout', 'who': ['osd.0', 'osd.1']}]
+        assert mons.flags[0] == set() and mons.flags[1] == set()
+        assert sorted(int(c['id']) for c in mons.cmds('osd metadata')) == [0, 1]
+        assert mons.version[0] == mons.version[1] == NEW
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+        # the ok-to-stop calls asked for exactly the set, with max = len
+        oks = mons.cmds('osd ok-to-stop')
+        assert all(c['max'] == len(c['ids']) for c in oks)
+        # next pass: PGs of h1 still recovering, h2 shares PGs with h1
+        # ([0,2,4], [1,3,8]) and every other host does too -> wait, do not pause
+        assert run.one_pass() is True
+        assert run.groups[-1] == []
+        assert not cephadm_module.upgrade.upgrade_state.paused
+        assert 'Waiting to stage' in cephadm_module.upgrade.upgrade_info_str
+        mons.recover()
+        assert run.one_pass() is True
+        assert run.groups[-1] == [2, 3]
+        # all the way through: six hosts, in order
+        for _ in range(4):
+            mons.recover()
+            run.one_pass()
+        assert run.groups == [[0, 1], [], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]]
+        assert all(v == NEW for v in mons.version.values())
+        # nothing left: the policy steps aside
+        assert run.one_pass() is False
+
+
+def test_osd_auto_level_takes_racks_and_falls_back_to_hosts(cephadm_module: CephadmOrchestrator):
+    # r1 can never go as a whole (PGs [0,2,4] and [1,3,8] have two copies
+    # in it), r2 and r3 can: auto does r2, r3, then r1 host by host.
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, level='auto') as run:
+        run.one_pass()
+        assert run.groups[-1] == [4, 5, 6, 7]                  # rack r2 (r1 refused)
+        mons.recover()
+        run.one_pass()
+        assert run.groups[-1] == [8, 9, 10, 11]                # rack r3
+        mons.recover()
+        run.one_pass()
+        assert run.groups[-1] == [0, 1]                        # r1 still refused -> host h1
+        mons.recover()
+        run.one_pass()
+        assert run.groups[-1] == [2, 3]                        # h2
+        assert all(v == NEW for v in mons.version.values())
+        # labels say what was switched
+        assert [c for c in mons.cmds('osd set-group')][0]['who'] == ['osd.4', 'osd.5', 'osd.6', 'osd.7']
+
+
+def test_osd_explicit_level_never_descends_but_does_not_stall(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, level='rack') as run:
+        run.one_pass()
+        mons.recover()
+        run.one_pass()
+        mons.recover()
+        assert run.groups == [[4, 5, 6, 7], [8, 9, 10, 11]]
+        # only r1 is left and it can never be stopped as a whole, while its
+        # OSDs can one by one: no host-level group (the level is explicit),
+        # the regular path gets this pass instead of waiting forever
+        assert run.one_pass() is False
+        assert run.groups[-1] == [] and run.staged.count('osd.0') == 0
+        assert not cephadm_module.upgrade.upgrade_state.paused
+        # ... whereas right after a switch, with PGs recovering, it waits
+        mons2 = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons2, level='rack') as run2:
+        run2.one_pass()
+        assert run2.groups[-1] == [4, 5, 6, 7]
+        assert run2.one_pass() is True                       # recovering: wait
+        assert run2.groups[-1] == []
+        info = cephadm_module.upgrade.upgrade_info_str
+        assert 'Waiting to stage' in info and 'rack r1' in info and 'PG(s) would become inactive' in info
+
+
+def test_osd_pg_check_covers_only_the_pending_osds(cephadm_module: CephadmOrchestrator):
+    # OSDs of the bucket already on the target are not restarted again
+    mons = _FakeOsdMons()
+    mons.version[0] = NEW
+    with _OsdRun(cephadm_module, mons) as run:
+        run.one_pass()
+        assert run.groups[-1] == [1]
+        assert run.staged == ['osd.1']
+        assert mons.cmds('osd ok-to-stop')[0]['ids'] == ['1']
+
+
+def test_osd_scope_of_crush_bucket_name(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        st = cephadm_module.upgrade.upgrade_state
+        st.crush_bucket_type, st.crush_bucket_name = 'rack', 'r2'
+        run.one_pass()
+        mons.recover()
+        run.one_pass()
+        mons.recover()
+        assert run.groups == [[4, 5], [6, 7]]
+        # nothing left in scope: the regular path (which filters too) takes over
+        assert run.one_pass() is False
+        assert run.groups[-1] == []
+        st.crush_bucket_name = 'nowhere'
+        assert run.one_pass() is True
+        assert st.paused and 'nowhere' in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+
+
+def test_osd_leaves_down_osds_and_offline_hosts_to_the_regular_path(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    mons.pgs = [pg for pg in mons.pgs if 1 not in pg[1]]   # osd.1 holds no PG
+    mons.up[1] = False                 # osd.1 is down: it has no window to miss
+    with _OsdRun(cephadm_module, mons) as run:
+        cephadm_module.offline_hosts.add('h2')
+        try:
+            run.one_pass()
+            assert run.groups[-1] == [0]
+            mons.recover()
+            run.one_pass()
+            assert run.groups[-1] == [4, 5]      # h2 skipped entirely
+            mons.recover()
+            for _ in range(3):
+                run.one_pass()
+                mons.recover()
+            # only osd.1 and h2 left: nothing for the policy
+            assert run.one_pass() is False
+            assert run.groups[-1] == []
+        finally:
+            cephadm_module.offline_hosts.discard('h2')
+        assert mons.version[1] == OLD and mons.version[2] == OLD and mons.version[3] == OLD
+        assert all(mons.version[o] == NEW for o in (0, 4, 5, 6, 7, 8, 9, 10, 11))
+
+
+def test_osd_recheck_before_the_window(cephadm_module: CephadmOrchestrator):
+    # ok-to-stop passes when the group is picked, but by the time staging
+    # is done another OSD is gone: nothing is restarted, the state is
+    # cleared and the pass ends without pausing
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        orig = mons.mon_command
+
+        def flaky(cmd, inbuf=None):
+            if cmd.get('prefix') == 'osd ok-to-stop' and len(mons.cmds('osd ok-to-stop')) == 1:
+                mons.up[2] = False     # a host dies after the first check
+            return orig(cmd, inbuf)
+
+        with mock.patch("cephadm.module.CephadmOrchestrator.mon_command", side_effect=flaky), \
+                mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command", side_effect=flaky):
+            assert run.one_pass() is True
+        assert sorted(run.staged) == ['osd.0', 'osd.1']
+        assert run.switched() == [] and run.groups[-1] == []
+        # noout was set at take_down and cleared again when the switch was called off
+        assert len(mons.cmds('osd set-group')) == 1 and len(mons.cmds('osd unset-group')) == 1
+        assert mons.flags[0] == set() and mons.flags[1] == set()
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+        assert 'no longer ok-to-stop' in cephadm_module.upgrade.upgrade_info_str
+
+
+def test_osd_one_osd_not_back_pauses_without_rollback_and_resumes(cephadm_module: CephadmOrchestrator):
+    # osd.1 does not come back: the group is NOT switched back (a store the
+    # new ceph-osd opened is not for the old one), the upgrade pauses with
+    # the state kept, noout stays on the group; once osd.1 is up again,
+    # `upgrade resume` re-verifies, restores and moves on
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, never_up=(1,)) as run:
+        run.one_pass()
+        assert len(run.switched()) == 2 and run.switched(rollback=True) == []
+        assert mons.version[0] == NEW and mons.version[1] == NEW
+        assert mons.flags[0] == {'noout'} and mons.flags[1] == {'noout'}
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.paused and st.staged_switch.get('phase') == 'switched'
+        hc = cephadm_module.health_checks['UPGRADE_SWITCH_FAILED']
+        assert 'osd.1 is not up' in hc['summary'] and 'upgrade resume' in hc['summary']
+        # the admin fixes osd.1, resumes
+        mons.up[1] = True
+        mons.epoch += 1
+        mons.up_from[1] = mons.epoch
+        st.paused = False
+        assert run.one_pass(dds=_osd_dds(mons, [])) is True
+        assert run.switched() == run.switched()[:2]          # nothing restarted again
+        assert mons.flags[0] == set() and mons.flags[1] == set()
+        assert st.staged_switch == {} and not st.paused
+
+
+def test_osd_old_version_after_switch_pauses(cephadm_module: CephadmOrchestrator):
+    # the daemon restarts but the monitors still see the old version
+    # (wrong image behind the tag): pause, no rollback
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        orig = mons.restart
+
+        def restart(osd_id, version, comes_back=True):
+            orig(osd_id, OLD if osd_id == 0 and version == NEW else version, comes_back)
+        mons.restart = restart
+        run.one_pass()
+        assert run.switched(rollback=True) == []
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.paused and st.staged_switch.get('phase') == 'switched'
+        assert "osd.0 reports version '19.2.8'" in cephadm_module.health_checks['UPGRADE_SWITCH_FAILED']['summary']
+
+
+def test_osd_switch_command_failure_pauses_and_resume_retries(cephadm_module: CephadmOrchestrator):
+    # switch-staged fails on h1 (nothing restarted there, the command
+    # checks before stopping): pause at 'switching'; on resume the
+    # idempotent switch is retried and goes through
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, switch_fails=(1,)) as run:
+        run.one_pass()
+        assert run.groups[-1] == [] and mons.version[0] == OLD
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.paused and st.staged_switch.get('phase') == 'switching'
+        assert 'osd.1: boom' in ' '.join(cephadm_module.health_checks['UPGRADE_SWITCH_FAILED']['detail'])
+        assert mons.flags[0] == {'noout'}
+    # the image is fixed on the host: resume
+    with _OsdRun(cephadm_module, mons) as run:
+        cephadm_module.upgrade.upgrade_state = st
+        st.paused = False
+        mons.commands.clear()
+        assert run.one_pass() is True
+        assert run.groups[-1] == [0, 1] and run.staged == []     # not staged again
+        assert mons.cmds('osd ok-to-stop') == []                  # resumed at 'switching': no re-check
+        assert mons.version[0] == mons.version[1] == NEW
+        assert mons.flags[0] == set() and st.staged_switch == {} and not st.paused
+
+
+def test_osd_resume_at_down_rechecks_ok_to_stop(cephadm_module: CephadmOrchestrator):
+    # mgr failover between take_down and the switch, and the cluster is no
+    # longer in a state to open the window: call it off, nothing restarted
+    mons = _FakeOsdMons()
+    mons.up[2] = False                                   # [0,2,4] has one copy left without 0
+    mons.flags[0].add('noout')
+    mons.flags[1].add('noout')
+    state = {'type': 'osd', 'key': '-10', 'label': 'host h1', 'daemons': ['osd.0', 'osd.1'],
+             'hosts': ['h1'], 'image': TARGET,
+             'data': {'bucket': 'h1', 'type': 'host', 'osd_ids': [0, 1], 'noout': True, 'committed': True},
+             'snapshot': {'epoch': 100, 'up_from': {'0': 10, '1': 10}}, 'phase': 'down'}
+    with _OsdRun(cephadm_module, mons) as run:
+        cephadm_module.upgrade.upgrade_state.staged_switch = state
+        assert run.one_pass(dds=_osd_dds(mons, [0, 1])) is True
+        assert len(mons.cmds('osd ok-to-stop')) >= 1 and run.switched() == []
+        assert mons.flags[0] == set() and mons.flags[1] == set()      # restored
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+        assert 'no longer ok-to-stop' in cephadm_module.upgrade.upgrade_info_str
+
+
+def test_osd_any_osd_failure_since_the_choice_calls_the_switch_off(cephadm_module: CephadmOrchestrator):
+    # osd.11 shares no PG with h1, so ok-to-stop would still clear h1 - but
+    # an OSD went down since the group was chosen: the verdict was given
+    # for another cluster, start over
+    mons = _FakeOsdMons()
+    mons.pgs = [pg for pg in mons.pgs if 11 not in pg[1]]
+    with _OsdRun(cephadm_module, mons) as run:
+        orig = mons.mon_command
+
+        def flaky(cmd, inbuf=None):
+            if cmd.get('prefix') == 'osd set-group':
+                mons.up[11] = False            # dies while h1 is being staged
+            return orig(cmd, inbuf)
+
+        with mock.patch("cephadm.module.CephadmOrchestrator.mon_command", side_effect=flaky), \
+                mock.patch("cephadm.module.CephadmOrchestrator.check_mon_command", side_effect=flaky):
+            assert run.one_pass() is True
+        assert sorted(run.staged) == ['osd.0', 'osd.1'] and run.switched() == []
+        assert mons.flags[0] == set() and mons.flags[1] == set()
+        assert len(mons.cmds('osd ok-to-stop')) == 1        # the fingerprint spoke first
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+        assert 'set of up OSDs changed' in cephadm_module.upgrade.upgrade_info_str
+
+
+def test_osd_resume_without_a_purged_daemon(cephadm_module: CephadmOrchestrator):
+    # osd.1 never came back after the switch, the admin purged it and
+    # resumed: the group goes on without it instead of wedging
+    mons = _FakeOsdMons()
+    mons.restart(0, NEW)
+    mons.flags[0].add('noout')
+    state = {'type': 'osd', 'key': '-10', 'label': 'host h1', 'daemons': ['osd.0', 'osd.1'],
+             'hosts': ['h1'], 'image': TARGET,
+             'data': {'bucket': 'h1', 'type': 'host', 'osd_ids': [0, 1], 'noout': True, 'committed': True},
+             'snapshot': {'epoch': 100, 'up_from': {'0': 10, '1': 10}}, 'phase': 'switched'}
+    with _OsdRun(cephadm_module, mons, dds=_osd_dds(mons, [0] + list(range(2, 12)))) as run:
+        cephadm_module.upgrade.upgrade_state.staged_switch = state
+        assert run.one_pass(dds=[]) is True
+        assert run.switched() == []
+        assert mons.cmds('osd unset-group') == [{'prefix': 'osd unset-group', 'flags': 'noout', 'who': ['osd.0']}]
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+
+
+def test_osd_group_cap_option(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, level='auto') as run:
+        cephadm_module.upgrade_staged_switch_osd_max_group = 3
+        run.one_pass()
+        # racks hold 4 pending OSDs > 3: skipped for the host level
+        assert run.groups[-1] == [0, 1]
+        cephadm_module.upgrade_staged_switch_osd_max_group = 0
+        mons.recover()
+        run.one_pass()
+        assert run.groups[-1] == [2, 3]                  # the rest of rack r1, as a rack
+
+
+def test_osd_verify_timeout_is_its_own_option(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        cephadm_module.upgrade_staged_switch_osd_timeout = 777
+        policy = policy_for(cephadm_module.upgrade, 'osd')
+        assert policy is not None and policy.verify_timeout() == 777
+        assert policy.rollback_on_failure is False
+        del run
+
+
+def test_osd_noout_can_be_disabled(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons, noout=False) as run:
+        run.one_pass()
+        assert run.groups[-1] == [0, 1]
+        assert mons.cmds('osd set-group') == [] and mons.cmds('osd unset-group') == []
+
+
+def test_osd_bad_level_pauses(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    for level, text in (('osd', 'makes no sense'), ('root', 'only used by root buckets')):
+        with _OsdRun(cephadm_module, mons, level=level) as run:
+            assert run.one_pass() is True
+            assert run.staged == []
+            st = cephadm_module.upgrade.upgrade_state
+            assert st.paused
+            assert text in cephadm_module.health_checks['UPGRADE_STAGE_FAILED']['summary']
+    # a type the map does not have: nothing to group by, regular path
+    with _OsdRun(cephadm_module, mons, level='rak') as run:
+        assert run.one_pass() is False
+        assert run.staged == [] and not cephadm_module.upgrade.upgrade_state.paused
+
+
+def test_osd_limit_caps_the_group(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        st = cephadm_module.upgrade.upgrade_state
+        st.total_count, st.remaining_count = 3, 3
+        run.one_pass()
+        assert run.groups[-1] == [0, 1] and st.remaining_count == 1
+        mons.recover()
+        run.one_pass()
+        assert run.groups[-1] == [2] and st.remaining_count == 0
+        mons.recover()
+        assert run.one_pass() is False
+
+
+def test_osd_resume_mid_switch_does_not_ask_ok_to_stop_again(cephadm_module: CephadmOrchestrator):
+    # mgr failover while switching h1: osd.0 was restarted, osd.1 not yet.
+    # PGs are degraded so ok-to-stop would refuse, but the group is
+    # committed: finish the switch, verify, restore.
+    mons = _FakeOsdMons()
+    mons.restart(0, NEW)
+    mons.flags[0].add('noout')
+    mons.flags[1].add('noout')
+    state = {'type': 'osd', 'key': '-10', 'label': 'host h1', 'daemons': ['osd.0', 'osd.1'],
+             'hosts': ['h1'], 'image': TARGET,
+             'data': {'bucket': 'h1', 'type': 'host', 'osd_ids': [0, 1], 'noout': True, 'committed': True},
+             'snapshot': {'epoch': 100, 'up_from': {'0': 10, '1': 10}}, 'phase': 'switching'}
+    with _OsdRun(cephadm_module, mons) as run:
+        cephadm_module.upgrade.upgrade_state.staged_switch = state
+        assert run.one_pass(dds=_osd_dds(mons, [1])) is True
+        assert mons.cmds('osd ok-to-stop') == []
+        assert run.staged == []
+        assert len(run.switched()) == 2                     # idempotent switch-staged on both
+        assert mons.version[1] == NEW
+        assert mons.flags[0] == set() and mons.flags[1] == set()
+        st = cephadm_module.upgrade.upgrade_state
+        assert st.staged_switch == {} and not st.paused
+
+
+def test_osd_staging_generates_config_and_passes_the_uuid_map(cephadm_module: CephadmOrchestrator):
+    mons = _FakeOsdMons()
+    with _OsdRun(cephadm_module, mons) as run:
+        with mock.patch.object(cephadm_module.osd_service, 'generate_config',
+                               return_value=({'config': '', 'keyring': ''}, [])) as gen:
+            run.one_pass()
+        assert sorted(c.args[0].name() for c in gen.call_args_list) == ['osd.0', 'osd.1']
+        # the fake _create_daemon asserted the uuid map was handed over
+        assert sorted(run.staged) == ['osd.0', 'osd.1']
