@@ -4075,14 +4075,18 @@ def deploy_daemon(ctx: CephadmContext, fsid: str, daemon_type: str,
     with write_new(data_dir + '/unit.configured', owner=(uid, gid)) as f:
         f.write('mtime is time we were last configured\n')
 
-    update_firewalld(ctx, daemon_type)
+    # Staging changes nothing a firewall rule depends on: the daemon is
+    # already deployed - its service and ports already allowed - and
+    # `switch-staged` reuses them. (Each update reloads firewalld.)
+    if deployment_type != DeploymentType.STAGE:
+        update_firewalld(ctx, daemon_type)
 
-    # Open ports explicitly required for the daemon
-    if not ('skip_firewalld' in ctx and ctx.skip_firewalld):
-        if endpoints:
-            fw = Firewalld(ctx)
-            fw.open_ports([e.port for e in endpoints] + fw.external_ports.get(daemon_type, []))
-            fw.apply_rules()
+        # Open ports explicitly required for the daemon
+        if not ('skip_firewalld' in ctx and ctx.skip_firewalld):
+            if endpoints:
+                fw = Firewalld(ctx)
+                fw.open_ports([e.port for e in endpoints] + fw.external_ports.get(daemon_type, []))
+                fw.apply_rules()
 
     # If this was a reconfig and the daemon is not a Ceph daemon, restart it
     # so it can pick up potential changes to its configuration files
@@ -4467,8 +4471,12 @@ def deploy_daemon_units(
         with write_new(data_dir + '/unit.image' + suffix) as f:
             f.write(c.image + '\n')
 
-    # sysctl
-    install_sysctl(ctx, fsid, daemon_type)
+    # sysctl (`_orch deploy-staged`: once per daemon type for the call)
+    sysctl_done: Optional[Set[str]] = getattr(ctx, 'staged_sysctl_done', None)
+    if sysctl_done is None or daemon_type not in sysctl_done:
+        install_sysctl(ctx, fsid, daemon_type)
+        if sysctl_done is not None:
+            sysctl_done.add(daemon_type)
 
     # systemd
     install_base_units(ctx, fsid)
@@ -7019,13 +7027,13 @@ def get_deployment_type(ctx: CephadmContext, daemon_type: str, daemon_id: str) -
         if not os.path.exists(os.path.join(data_dir, 'unit.run')):
             raise Error(f'cannot stage {ctx.name}: it has not been deployed on this host')
         deployment_type = DeploymentType.STAGE
-    unit_name = get_unit_name(ctx.fsid, daemon_type, daemon_id)
-    (_, state, _) = check_unit(ctx, unit_name)
-    if state == 'running' or is_container_running(ctx, CephContainer.for_daemon(ctx, ctx.fsid, daemon_type, daemon_id, 'bash')):
-        # if reconfig was set, that takes priority over redeploy. If
-        # this is considered a fresh deployment at this stage,
-        # mark it as a redeploy to avoid port checking
-        if deployment_type == DeploymentType.DEFAULT:
+    # if reconfig (or stage) was set, that takes priority over redeploy: only
+    # a fresh deployment of a daemon found running is marked as a redeploy
+    # (to avoid port checking), so only then look at the running state
+    if deployment_type == DeploymentType.DEFAULT:
+        unit_name = get_unit_name(ctx.fsid, daemon_type, daemon_id)
+        (_, state, _) = check_unit(ctx, unit_name)
+        if state == 'running' or is_container_running(ctx, CephContainer.for_daemon(ctx, ctx.fsid, daemon_type, daemon_id, 'bash')):
             deployment_type = DeploymentType.REDEPLOY
 
     logger.info(f'{deployment_type.value} daemon {ctx.name} ...')
@@ -7101,8 +7109,10 @@ def command_deploy_staged(ctx: CephadmContext) -> None:
     params.stage=true for each entry of a JSON list of deploy configurations,
     under one acquisition of the cluster lock (that `_orch deploy` takes for
     each daemon, so concurrent calls would only queue), checking each target
-    image runs once rather than once per daemon, and reloading systemd once
-    at the end. A daemon that cannot be staged does not stop the others.
+    image runs and looking up the uid/gid of its Ceph daemons once rather
+    than once per daemon, applying the sysctl settings once per daemon type,
+    and reloading systemd once at the end (staging touches no firewall
+    rule). A daemon that cannot be staged does not stop the others.
     Prints a JSON object: name -> {"ok": true} or {"error": "..."}; exits
     with an error if any daemon could not be staged.
     """
@@ -7112,6 +7122,8 @@ def command_deploy_staged(ctx: CephadmContext) -> None:
     lock = FileLock(ctx, ctx.fsid)
     lock.acquire()
     verified: Dict[Tuple[str, str], str] = {}
+    uid_gids: Dict[Tuple[str, str], Tuple[int, int]] = {}
+    sysctl_done: Set[str] = set()
     results: Dict[str, Dict[str, Any]] = {}
     staged = 0
     for config_data in configs:
@@ -7124,6 +7136,8 @@ def command_deploy_staged(ctx: CephadmContext) -> None:
             dctx = _context_of_its_own(ctx)
             apply_deploy_config_to_ctx(config_data, dctx)
             dctx.verified_staged_images = verified
+            dctx.staged_uid_gids = uid_gids
+            dctx.staged_sysctl_done = sysctl_done
             dctx.defer_daemon_reload = True
             _common_deploy(dctx, lock=False)
             results[name] = {'ok': True}
@@ -7177,7 +7191,17 @@ def _dispatch_deploy(
 ) -> None:
     if daemon_type in Ceph.daemons:
         config, keyring = get_config_and_keyring(ctx)
-        uid, gid = extract_uid_gid(ctx)
+        # `_orch deploy-staged`: the uid/gid of a Ceph daemon only depends on
+        # the image (a throwaway container stats /var/lib/ceph in it): once
+        # per daemon type and image for the whole call
+        uid_gids: Optional[Dict[Tuple[str, str], Tuple[int, int]]] = getattr(ctx, 'staged_uid_gids', None)
+        uid_gid_key = (daemon_type, ctx.image)
+        if uid_gids is not None and uid_gid_key in uid_gids:
+            uid, gid = uid_gids[uid_gid_key]
+        else:
+            uid, gid = extract_uid_gid(ctx)
+            if uid_gids is not None:
+                uid_gids[uid_gid_key] = (uid, gid)
         make_var_run(ctx, ctx.fsid, uid, gid)
 
         config_json = fetch_configs(ctx)

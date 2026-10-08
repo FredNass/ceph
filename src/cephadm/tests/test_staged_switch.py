@@ -413,6 +413,7 @@ class TestDeployStaged:
         seen = []
 
         def common_deploy(dctx, lock=True):
+            assert isinstance(dctx.staged_uid_gids, dict) and isinstance(dctx.staged_sysctl_done, set)
             seen.append((dctx.name, dctx.stage, lock, dctx.defer_daemon_reload,
                          id(dctx.verified_staged_images), dctx.config_blobs['config']))
             if deploy:
@@ -488,3 +489,78 @@ class TestDeployStaged:
                 assert _cephadm.verify_staged_image(ctx, c) == 'ceph version 99'
                 assert _cephadm.verify_staged_image(ctx, c) == 'ceph version 99'
             assert run.call_count == 1
+
+
+class TestStagePerDaemonWork:
+    """What staging does not need to repeat for every daemon: the firewall
+    (untouched), the uid/gid lookup and the sysctl settings (once per call
+    of `_orch deploy-staged`), the running-state check (stage takes
+    priority over redeploy)."""
+
+    def test_stage_touches_no_firewall_rule(self, cephadm_fs):
+        with with_cephadm_ctx([f'--image={NEW_IMAGE}'], list_networks={}) as ctx:
+            ctx.fsid = FSID
+            ctx.container_engine = mock_podman()
+            _live_daemon()
+            c = _cephadm.get_container(ctx, FSID, 'mds', 'a')
+            with mock.patch('cephadm.deploy_daemon_units') as units, \
+                    mock.patch('cephadm.verify_staged_image'), \
+                    mock.patch('cephadm.create_daemon_dirs'), \
+                    mock.patch('cephadm.update_firewalld') as update_firewalld, \
+                    mock.patch('cephadm.Firewalld') as firewalld:
+                _cephadm.deploy_daemon(ctx, FSID, 'mds', 'a', c, 0, 0, config='C', keyring='K',
+                                       deployment_type=_cephadm.DeploymentType.STAGE,
+                                       endpoints=[_cephadm.EndPoint('0.0.0.0', 6800)])
+            assert units.call_args.kwargs.get('stage') is True
+            update_firewalld.assert_not_called()
+            firewalld.assert_not_called()
+
+    def test_uid_gid_looked_up_once_per_call(self):
+        with with_cephadm_ctx([f'--image={NEW_IMAGE}'], list_networks={}) as ctx:
+            ctx.fsid = FSID
+            ctx.osd_fsid = None
+            ctx.allow_ptrace = False
+            ctx.staged_uid_gids = {}
+            with mock.patch('cephadm.extract_uid_gid', return_value=(167, 167)) as uid_gid, \
+                    mock.patch('cephadm.get_config_and_keyring', return_value=('C', 'K')), \
+                    mock.patch('cephadm.make_var_run'), \
+                    mock.patch('cephadm.fetch_configs', return_value={}), \
+                    mock.patch('cephadm.get_deployment_container'), \
+                    mock.patch('cephadm.deploy_daemon') as deploy:
+                for daemon_id in ('a', 'b'):
+                    _cephadm._dispatch_deploy(ctx, 'mds', daemon_id, [], _cephadm.DeploymentType.STAGE)
+            assert uid_gid.call_count == 1
+            assert [c.args[5:7] for c in deploy.call_args_list] == [(167, 167), (167, 167)]
+
+    def test_sysctl_once_per_daemon_type_per_call(self, cephadm_fs):
+        with with_cephadm_ctx([f'--image={NEW_IMAGE}'], list_networks={}) as ctx:
+            ctx.fsid = FSID
+            ctx.container_engine = mock_podman()
+            ctx.staged_sysctl_done = set()
+            ctx.defer_daemon_reload = True
+            _live_daemon()
+            c = _cephadm.get_container(ctx, FSID, 'mds', 'a')
+            with mock.patch('cephadm.call_throws'), \
+                    mock.patch('cephadm.call'), \
+                    mock.patch('cephadm.install_sysctl') as install_sysctl, \
+                    mock.patch('cephadm.install_base_units'):
+                for _ in range(2):
+                    _cephadm.deploy_daemon_units(ctx, FSID, 0, 0, 'mds', 'a', c, stage=True)
+            assert install_sysctl.call_count == 1
+
+    def test_stage_does_not_look_at_the_running_state(self, cephadm_fs):
+        with with_cephadm_ctx(['--image', NEW_IMAGE, 'deploy', '--name', 'mds.a',
+                               '--fsid', FSID, '--stage']) as ctx:
+            _live_daemon()
+            with mock.patch('cephadm.check_unit') as check_unit, \
+                    mock.patch('cephadm.is_container_running') as running:
+                assert _cephadm.get_deployment_type(ctx, 'mds', 'a') is _cephadm.DeploymentType.STAGE
+            check_unit.assert_not_called()
+            running.assert_not_called()
+
+    def test_default_still_becomes_redeploy_when_running(self, cephadm_fs):
+        with with_cephadm_ctx(['--image', NEW_IMAGE, 'deploy', '--name', 'mds.a',
+                               '--fsid', FSID]) as ctx:
+            with mock.patch('cephadm.check_unit', return_value=(True, 'running', True)), \
+                    mock.patch('cephadm.is_container_running', return_value=False):
+                assert _cephadm.get_deployment_type(ctx, 'mds', 'a') is _cephadm.DeploymentType.REDEPLOY
