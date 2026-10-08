@@ -604,6 +604,19 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                  'stays active.'
         ),
         Option(
+            'upgrade_staged_switch_osd_pause',
+            type='int',
+            default=0,
+            desc='With the staged switch for OSDs, seconds to wait between two '
+                 'groups: once a group is back and every PG of its OSDs is '
+                 'active+clean, wait this long before the next group is chosen. '
+                 'A lever against effects of restarting OSDs back to back that '
+                 'the PG states do not show (cold caches...). 0 (the default) '
+                 'means no pause, the next group is chosen as soon as the '
+                 'previous one has caught up. Setting it back to 0 ends a pause '
+                 'in progress.'
+        ),
+        Option(
             'upgrade_mds_fail_unhealthy_fs',
             type='bool',
             default=False,
@@ -752,6 +765,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.upgrade_staged_switch_osd_noout = True
             self.upgrade_staged_switch_osd_timeout = 600
             self.upgrade_staged_switch_osd_max_group = 0
+            self.upgrade_staged_switch_osd_pause = 0
             self.upgrade_mds_fail_unhealthy_fs = False
             self.upgrade_skip_order_check = False
             self.device_enhanced_scan = False
