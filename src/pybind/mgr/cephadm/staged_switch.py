@@ -479,7 +479,7 @@ class StagedSwitchRunner:
                 return True, ''
             if time.time() >= deadline:
                 return False, why
-            time.sleep(2)
+            time.sleep(1)
 
     def _wait_settled(self, group: StagedGroup) -> Tuple[bool, str]:
         deadline = time.time() + SETTLE_POLL_SECONDS
@@ -489,7 +489,7 @@ class StagedSwitchRunner:
                 return ok, why
             if self.upgrade.upgrade_state is None or self.upgrade.upgrade_state.paused:
                 return ok, why
-            time.sleep(2)
+            time.sleep(1)
 
     # --------------------------------------------------------------- driver
     def _group_from_state(self, need_upgrade: List[DaemonDescription]) -> Optional[StagedGroup]:
@@ -760,10 +760,12 @@ class StagedSwitchRunner:
 # ======================================================================
 
 OSD_CRUSH_LEVEL_AUTO = 'auto'
-# like CephadmUpgrade._wait_for_ok_to_stop: a few tries within one pass,
-# then let the next pass ask again
-OSD_OK_TO_STOP_TRIES = 4
-OSD_OK_TO_STOP_RETRY_SECONDS = 15
+# how long one pass keeps asking ok-to-stop (like the four tries, 15 s
+# apart, of CephadmUpgrade._wait_for_ok_to_stop) before letting the next
+# pass ask again, and how often: a bucket that can go is taken within a
+# couple of seconds rather than at the next 15 s try
+OSD_OK_TO_STOP_WAIT_SECONDS = 45
+OSD_OK_TO_STOP_POLL_SECONDS = 2
 # PG states in which a PG has not settled on an acting set yet
 OSD_UNSETTLED_PG_STATES = frozenset(
     ('unknown', 'creating', 'peering', 'activating', 'stale', 'down', 'incomplete'))
@@ -1091,11 +1093,8 @@ class OsdStagedSwitchPolicy(StagedSwitchPolicy):
             return []
         limit = state.remaining_count if state.remaining_count is not None and state.remaining_count > 0 else None
         reasons: List[str] = []
-        for attempt in range(OSD_OK_TO_STOP_TRIES):
-            if attempt:
-                if self._paused():
-                    raise StagedSwitchNotReady('upgrade paused')
-                time.sleep(OSD_OK_TO_STOP_RETRY_SECONDS)
+        deadline = time.time() + OSD_OK_TO_STOP_WAIT_SECONDS
+        while True:
             group, reasons, any_bucket = self._pick(tree, levels, pending, limit)
             if group is not None:
                 logger.info('Upgrade: staged switch picked %s: %d OSD(s) %s', group.label,
@@ -1106,6 +1105,11 @@ class OsdStagedSwitchPolicy(StagedSwitchPolicy):
                 logger.info('Upgrade: no %s bucket holds an OSD still to upgrade; '
                             'the regular upgrade path takes over', '/'.join(levels))
                 return []
+            if time.time() >= deadline:
+                break
+            if self._paused():
+                raise StagedSwitchNotReady('upgrade paused')
+            time.sleep(OSD_OK_TO_STOP_POLL_SECONDS)
         summary = (f'no {"/".join(levels)} bucket can be switched as a whole right now, every PG '
                    f'must stay active ({"; ".join(reasons[:3])}{"; ..." if len(reasons) > 3 else ""})')
         if self._some_osd_ok_to_stop_alone(tree, levels, pending):
@@ -1170,13 +1174,14 @@ class OsdStagedSwitchPolicy(StagedSwitchPolicy):
         if fp and self._up_fingerprint(self._osds(), ids) != fp:
             raise StagedSwitchNotReady(
                 f'the set of up OSDs changed since {group.label} was chosen')
-        for attempt in range(OSD_OK_TO_STOP_TRIES):
+        deadline = time.time() + OSD_OK_TO_STOP_WAIT_SECONDS
+        while True:
             ok, why = self._ok_to_stop(ids)
             if ok:
                 return
-            if attempt == OSD_OK_TO_STOP_TRIES - 1 or self._paused():
+            if time.time() >= deadline or self._paused():
                 raise StagedSwitchNotReady(f'{group.label} is no longer ok-to-stop: {why}')
-            time.sleep(OSD_OK_TO_STOP_RETRY_SECONDS)
+            time.sleep(OSD_OK_TO_STOP_POLL_SECONDS)
 
     def forget(self, state: Dict[str, Any], names: List[str]) -> None:
         gone = {int(n.split('.', 1)[1]) for n in names if n.split('.', 1)[1].isdigit()}
