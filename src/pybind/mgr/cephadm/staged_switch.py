@@ -31,6 +31,33 @@ out of the outage window:
            Not a failure when it takes long: no timeout, the upgrade is not
            paused, the next serve() pass asks again.
 
+A policy that can tell in advance which daemons it will switch has them
+all staged once, at the start of their phase (stage ahead, hosts in
+parallel, daemons still serving); a group then re-stages only the daemons
+whose staged deployment would no longer be the same - another target image,
+another generated configuration - so the staging is mostly out of the time
+between two groups.
+
+If staging fails nothing has been restarted and the upgrade pauses with
+UPGRADE_STAGE_FAILED. If the switch or the verification fails, a policy
+with ``rollback_on_failure`` (MDS) has every daemon switched back to its
+previous unit files and the group restored on the previous release; one
+without (OSD: a store a newer ceph-osd has opened is not to be reopened
+by the previous release) leaves the daemons as they are and the upgrade
+resumes at the same phase once the admin has dealt with them. Either way
+the upgrade pauses with UPGRADE_SWITCH_FAILED. Progress is persisted in
+UpgradeState.staged_switch so a mgr failover resumes at the right phase;
+every phase is idempotent.
+
+A policy can also answer "not now" (StagedSwitchNotReady): nothing is
+staged, the upgrade is not paused, and the next serve() pass asks again.
+This is how the OSD policy waits for the PGs to recover between groups.
+
+The runner is daemon-type agnostic. What a "group" is, how it is taken
+down, verified and restored is a StagedSwitchPolicy. Two are shipped here:
+MdsStagedSwitchPolicy (one filesystem at a time, behind ``fail_fs``) and
+OsdStagedSwitchPolicy (every OSD still to upgrade under one CRUSH bucket of
+a given type, when ``osd ok-to-stop`` says every PG stays active).
 If staging fails nothing has been restarted and the upgrade pauses with
 UPGRADE_STAGE_FAILED. If the switch or the verification fails, a policy
 with ``rollback_on_failure`` (MDS) has every daemon switched back to its
@@ -201,6 +228,13 @@ class StagedSwitchPolicy(ABC):
         """Put the group back into service. Called after a successful
         verify, and after a rollback."""
 
+    def stage_ahead(self, need_upgrade: List[DaemonDescription]) -> List[DaemonDescription]:
+        """The daemons to stage at once, ahead of their groups (default:
+        none - each group is staged when it is picked). Only daemons this
+        policy will switch itself; staged files of a daemon that ends up
+        upgraded another way are inert."""
+        return []
+
     def settled(self, group: StagedGroup) -> Tuple[bool, str]:
         """Whether the group, verified and restored, has settled enough for
         the next group to be chosen (OSD: caught up with the writes it
@@ -252,45 +286,133 @@ class StagedSwitchRunner:
             by_host.setdefault(d.hostname, []).append(d)
         return by_host
 
-    async def _stage_all(self, group: StagedGroup, target_image: str) -> Dict[str, str]:
-        """deploy --stage every daemon: up to max_parallel hosts at a time,
-        the daemons of one host one after the other (each staging starts
-        containers of its own; cephadm's per-host lock would serialize them
-        anyway). name -> error."""
+    @staticmethod
+    def _stage_fingerprint(spec: CephadmDaemonDeploySpec, target_image: str) -> str:
+        """What a staged deployment depends on: the target image, the
+        generated configuration (config, keyring, files) and the deps."""
+        blob = json.dumps({'image': target_image, 'config': spec.final_config,
+                           'deps': spec.deps}, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def _stage_spec(self, d: DaemonDescription, target_image: str) -> CephadmDaemonDeploySpec:
+        assert d.daemon_type is not None and d.daemon_id is not None
+        self.mgr._daemon_action_set_image('redeploy', target_image, d.daemon_type, d.daemon_id)
+        spec = CephadmDaemonDeploySpec.from_daemon_description(d)
+        if d.daemon_type != 'osd':
+            spec = self.mgr.cephadm_services[
+                daemon_type_to_service(d.daemon_type)].prepare_create(spec)
+        else:
+            # like _daemon_action: OSDs get their config refreshed but not
+            # the full prepare_create
+            spec.final_config, spec.deps = self.mgr.osd_service.generate_config(spec)
+        return spec
+
+    def _ahead(self, target_image: str) -> Dict[str, str]:
+        """name -> fingerprint of the daemons of this type staged ahead
+        for this target image."""
+        assert self.upgrade.upgrade_state is not None
+        st = self.upgrade.upgrade_state.staged_ahead.get(self.policy.daemon_type) or {}
+        return dict(st.get('daemons') or {}) if st.get('image') == target_image else {}
+
+    async def _stage(self, daemons: List[DaemonDescription], target_image: str,
+                     already: Optional[Dict[str, str]] = None
+                     ) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
+        """deploy --stage every daemon whose staged deployment is not already
+        the one it would get now (`already`: name -> fingerprint): up to
+        max_parallel hosts at a time, the daemons of one host in one cephadm
+        call (`_orch deploy-staged`: one lock, one image check, one
+        daemon-reload). Returns (name -> error, name -> fingerprint staged,
+        names skipped)."""
         sem = asyncio.Semaphore(max(1, int(self.mgr.upgrade_staged_switch_max_parallel)))
         errors: Dict[str, str] = {}
-        # one osdmap read for the whole group rather than one per OSD
+        staged: Dict[str, str] = {}
+        skipped: List[str] = []
+        already = already or {}
+        # one osdmap read for the whole call rather than one per OSD
         osd_uuid_map: Optional[Dict[str, Any]] = None
-        if any(d.daemon_type == 'osd' for d in group.daemons):
+        if any(d.daemon_type == 'osd' for d in daemons):
             try:
                 osd_uuid_map = self.mgr.get_osd_uuid_map()
             except Exception as e:
                 logger.debug('Upgrade: could not read the osd uuid map up front: %s', e)
 
-        async def one(d: DaemonDescription) -> None:
-            assert d.daemon_type is not None and d.daemon_id is not None
-            try:
-                self.mgr._daemon_action_set_image('redeploy', target_image, d.daemon_type, d.daemon_id)
-                spec = CephadmDaemonDeploySpec.from_daemon_description(d)
-                if d.daemon_type != 'osd':
-                    spec = self.mgr.cephadm_services[
-                        daemon_type_to_service(d.daemon_type)].prepare_create(spec)
-                else:
-                    # like _daemon_action: OSDs get their config refreshed
-                    # but not the full prepare_create
-                    spec.final_config, spec.deps = self.mgr.osd_service.generate_config(spec)
-                await CephadmServe(self.mgr)._create_daemon(
-                    spec, osd_uuid_map=osd_uuid_map, stage=True)
-            except Exception as e:
-                errors[d.name()] = str(e)
-
-        async def host(daemons: List[DaemonDescription]) -> None:
+        async def host(hostname: str, daemons: List[DaemonDescription]) -> None:
             async with sem:
+                todo: List[Tuple[CephadmDaemonDeploySpec, str]] = []
                 for d in daemons:
-                    await one(d)
+                    try:
+                        spec = self._stage_spec(d, target_image)
+                        fp = self._stage_fingerprint(spec, target_image)
+                    except Exception as e:
+                        errors[d.name()] = str(e)
+                        continue
+                    if already.get(d.name()) == fp:
+                        skipped.append(d.name())
+                    else:
+                        todo.append((spec, fp))
+                if not todo:
+                    return
+                try:
+                    failed = await CephadmServe(self.mgr)._stage_daemons(
+                        hostname, [spec for spec, _ in todo], osd_uuid_map=osd_uuid_map)
+                except Exception as e:
+                    failed = {spec.name(): str(e) for spec, _ in todo}
+                for spec, fp in todo:
+                    if spec.name() in failed:
+                        errors[spec.name()] = failed[spec.name()]
+                    else:
+                        staged[spec.name()] = fp
 
-        await asyncio.gather(*[host(ds) for ds in self._by_host(group).values()])
+        by_host: Dict[str, List[DaemonDescription]] = {}
+        for d in daemons:
+            assert d.hostname is not None
+            by_host.setdefault(d.hostname, []).append(d)
+        await asyncio.gather(*[host(h, ds) for h, ds in by_host.items()])
+        return errors, staged, skipped
+
+    async def _stage_all(self, group: StagedGroup, target_image: str) -> Dict[str, str]:
+        """Stage the group, skipping the daemons staged ahead whose staged
+        deployment is still the right one. name -> error."""
+        errors, _, skipped = await self._stage(group.daemons, target_image,
+                                               already=self._ahead(target_image))
+        if skipped:
+            logger.info('Upgrade: %d %s of %s already staged ahead', len(skipped),
+                        self.policy.daemon_type, group.label)
         return errors
+
+    def _stage_ahead(self, need_upgrade: List[DaemonDescription], target_image: str) -> None:
+        """Once per daemon type and target image: stage every daemon the
+        policy names, ahead of their groups. A daemon that fails to stage
+        here is just not recorded: its group stages it again, and pauses
+        the upgrade if that fails too."""
+        assert self.upgrade.upgrade_state is not None
+        if not getattr(self.mgr, 'upgrade_staged_switch_stage_ahead', True):
+            return
+        st = self.upgrade.upgrade_state.staged_ahead.get(self.policy.daemon_type) or {}
+        if st.get('image') == target_image:
+            return
+        try:
+            daemons = self.policy.stage_ahead(need_upgrade)
+        except Exception as e:
+            # e.g. a configuration error: groups() reports it properly
+            logger.warning('Upgrade: not staging %s daemons ahead: %s', self.policy.daemon_type, e)
+            return
+        if not daemons:
+            return
+        self.upgrade.upgrade_info_str = (f'Staging {len(daemons)} {self.policy.daemon_type} '
+                                         f'daemon(s) ahead of their groups')
+        logger.info('Upgrade: staging %d %s daemon(s) on %d host(s) ahead of their groups',
+                    len(daemons), self.policy.daemon_type,
+                    len({d.hostname for d in daemons}))
+        start = time.time()
+        errors, staged, _ = self.mgr.wait_async(self._stage(daemons, target_image))
+        self.upgrade.upgrade_state.staged_ahead[self.policy.daemon_type] = {
+            'image': target_image, 'daemons': staged}
+        self.upgrade._save_upgrade_state()
+        logger.info('Upgrade: staged %d %s daemon(s) ahead in %.0fs%s', len(staged),
+                    self.policy.daemon_type, time.time() - start,
+                    f'; {len(errors)} will be staged with their group ({", ".join(sorted(errors)[:5])})'
+                    if errors else '')
 
     async def _switch_all(self, group: StagedGroup, target_image: str,
                           rollback: bool = False) -> Dict[str, str]:
@@ -446,6 +568,8 @@ class StagedSwitchRunner:
         if group is None:
             if remaining is not None and remaining <= 0:
                 return False  # --limit reached; the regular path ends the upgrade
+            if need_upgrade:
+                self._stage_ahead(need_upgrade, target_image)
             try:
                 groups = self.policy.groups(need_upgrade)
             except StagedSwitchNotReady as e:
@@ -1014,6 +1138,12 @@ class OsdStagedSwitchPolicy(StagedSwitchPolicy):
             if tried >= probes:
                 break
         return False
+
+    def stage_ahead(self, need_upgrade: List[DaemonDescription]) -> List[DaemonDescription]:
+        # every OSD this policy will switch itself: staged once, hosts in
+        # parallel, while they serve; the groups then only re-stage what
+        # changed since
+        return list(self._pending(need_upgrade, self._tree(), self._osds()).values())
 
     def take_down(self, group: StagedGroup) -> None:
         ids = [int(i) for i in group.data['osd_ids']]

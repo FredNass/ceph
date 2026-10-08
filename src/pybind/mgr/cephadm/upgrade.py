@@ -90,6 +90,7 @@ class UpgradeState:
                  image_mirror_done: bool = False,
                  mds_staged: Optional[Dict[str, Any]] = None,
                  staged_switch: Optional[Dict[str, Any]] = None,
+                 staged_ahead: Optional[Dict[str, Any]] = None,
                  ):
         self._target_name: str = target_name  # Use CephadmUpgrade.target_image instead.
         self.progress_id: str = progress_id
@@ -123,6 +124,9 @@ class UpgradeState:
         # handled (see cephadm.staged_switch: OSDs), so a mgr failover
         # resumes it
         self.staged_switch: Dict[str, Any] = staged_switch or {}
+        # daemons staged ahead of their group, per daemon type:
+        # {type: {'image': target image, 'daemons': {name: fingerprint}}}
+        self.staged_ahead: Dict[str, Any] = staged_ahead or {}
 
     def to_json(self) -> dict:
         return {
@@ -145,6 +149,7 @@ class UpgradeState:
             'image_mirror_done': self.image_mirror_done,
             'mds_staged': self.mds_staged,
             'staged_switch': self.staged_switch,
+            'staged_ahead': self.staged_ahead,
         }
 
     @classmethod

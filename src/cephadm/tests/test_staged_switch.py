@@ -397,3 +397,94 @@ class TestSwitchStagedSeveral:
         with pytest.raises(SystemExit):
             with with_cephadm_ctx(['switch-staged', '--fsid', FSID, '--name', 'mds.a', '--name', 'bogus.b']):
                 pass
+
+
+class TestDeployStaged:
+    """`_orch deploy-staged`: several `deploy --stage` in one call - one
+    acquisition of the cluster lock, the target image checked once, one
+    daemon-reload, one result per daemon."""
+
+    def _configs(self, names=('mds.a', 'mds.b'), stage=True):
+        return [{'name': n, 'fsid': FSID, 'image': NEW_IMAGE,
+                 'config_blobs': {'config': f'CONF {n}', 'keyring': f'KEY {n}'},
+                 'params': {'stage': stage}} for n in names]
+
+    def _run(self, configs, capsys, deploy=None):
+        seen = []
+
+        def common_deploy(dctx, lock=True):
+            seen.append((dctx.name, dctx.stage, lock, dctx.defer_daemon_reload,
+                         id(dctx.verified_staged_images), dctx.config_blobs['config']))
+            if deploy:
+                deploy(dctx)
+        with with_cephadm_ctx(['_orch', 'deploy-staged', '--fsid', FSID]) as ctx:
+            with mock.patch('cephadm.read_configuration_source', return_value=configs), \
+                    mock.patch('cephadm.FileLock') as lock, \
+                    mock.patch('cephadm.call_throws') as call_throws, \
+                    mock.patch('cephadm._common_deploy', side_effect=common_deploy):
+                err = None
+                try:
+                    _cephadm.command_deploy_staged(ctx)
+                except _cephadm.Error as e:
+                    err = e
+            assert not getattr(ctx, 'stage', False)       # each daemon had a context of its own
+        return err, json.loads(capsys.readouterr().out), lock, call_throws, seen
+
+    def test_stages_every_daemon_in_one_call(self, capsys):
+        err, out, lock, call_throws, seen = self._run(self._configs(), capsys)
+        assert err is None
+        assert out == {'mds.a': {'ok': True}, 'mds.b': {'ok': True}}
+        assert [(n, st, lk, defer, conf) for n, st, lk, defer, _, conf in seen] == [
+            ('mds.a', True, False, True, 'CONF mds.a'), ('mds.b', True, False, True, 'CONF mds.b')]
+        assert len({v for *_, v, _ in seen}) == 1          # one image-check cache for the call
+        assert lock.call_count == 1 and lock.return_value.acquire.call_count == 1
+        assert _systemctl_calls(call_throws) == [['systemctl', 'daemon-reload']]
+
+    def test_one_daemon_failing_does_not_stop_the_others(self, capsys):
+        def deploy(dctx):
+            if dctx.name == 'mds.a':
+                raise _cephadm.Error('cannot stage mds.a: it has not been deployed on this host')
+        err, out, lock, call_throws, seen = self._run(self._configs(), capsys, deploy)
+        assert 'not been deployed' in out['mds.a']['error'] and out['mds.b'] == {'ok': True}
+        assert err is not None and '1 of 2' in str(err)
+        assert _systemctl_calls(call_throws) == [['systemctl', 'daemon-reload']]
+
+    def test_only_stages(self, capsys):
+        err, out, lock, call_throws, seen = self._run(self._configs(names=('mds.a',), stage=False), capsys)
+        assert 'only stages' in out['mds.a']['error'] and err is not None
+        assert seen == [] and _systemctl_calls(call_throws) == []
+
+    def test_refuses_an_empty_request(self):
+        with with_cephadm_ctx(['_orch', 'deploy-staged', '--fsid', FSID]) as ctx:
+            with mock.patch('cephadm.read_configuration_source', return_value=[]):
+                with pytest.raises(_cephadm.Error, match='non-empty'):
+                    _cephadm.command_deploy_staged(ctx)
+
+    def test_parser(self):
+        with with_cephadm_ctx(['_orch', 'deploy-staged', '--fsid', FSID]) as ctx:
+            assert ctx.func is _cephadm.command_deploy_staged
+
+    def test_daemon_reload_deferred(self, cephadm_fs):
+        with with_cephadm_ctx([f'--image={NEW_IMAGE}'], list_networks={}) as ctx:
+            ctx.fsid = FSID
+            ctx.container_engine = mock_podman()
+            ctx.defer_daemon_reload = True
+            _live_daemon()
+            c = _cephadm.get_container(ctx, FSID, 'mds', 'a')
+            with mock.patch('cephadm.call_throws') as call_throws, \
+                    mock.patch('cephadm.call'), \
+                    mock.patch('cephadm.install_sysctl'), \
+                    mock.patch('cephadm.install_base_units'):
+                _cephadm.deploy_daemon_units(ctx, FSID, 0, 0, 'mds', 'a', c, stage=True)
+            assert _read(f'{DATA}/unit.image.staged').strip() == NEW_IMAGE
+            assert _systemctl_calls(call_throws) == []
+
+    def test_image_checked_once_per_call(self):
+        with with_cephadm_ctx([f'--image={NEW_IMAGE}'], list_networks={}) as ctx:
+            ctx.container_engine = mock_podman()
+            ctx.verified_staged_images = {}
+            c = _cephadm.CephContainer(ctx, image=NEW_IMAGE, entrypoint='/usr/bin/ceph-mds')
+            with mock.patch.object(_cephadm.CephContainer, 'run', return_value='ceph version 99') as run:
+                assert _cephadm.verify_staged_image(ctx, c) == 'ceph version 99'
+                assert _cephadm.verify_staged_image(ctx, c) == 'ceph version 99'
+            assert run.call_count == 1

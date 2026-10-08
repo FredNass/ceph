@@ -225,8 +225,13 @@ Starting the upgrade
                   upgrade status`` says why) - the upgrade is not paused,
 
                #. stages the new deployment of every OSD of the group while
-                  they serve (hosts in parallel, the OSDs of a host one after
-                  the other),
+                  they serve (hosts in parallel, the OSDs of a host in one
+                  ``cephadm`` call). With
+                  ``mgr/cephadm/upgrade_staged_switch_stage_ahead`` (the
+                  default), every OSD to upgrade has already been staged
+                  once, at the start of the OSD phase, and only the OSDs
+                  whose target image or generated configuration changed
+                  since are staged again here,
 
                #. sets ``noout`` on exactly those OSDs (``ceph osd set-group
                   noout``), checks that no OSD outside the group has gone down
@@ -326,6 +331,10 @@ Starting the upgrade
      (with ``auto``, the next level down is tried).
    * ``mgr/cephadm/upgrade_staged_switch_max_parallel`` (default ``16``):
      how many hosts to stage or switch at once.
+   * ``mgr/cephadm/upgrade_staged_switch_stage_ahead`` (default ``true``):
+     stage every OSD to upgrade once, at the start of the OSD phase, instead
+     of group by group; a group then re-stages only the OSDs whose target
+     image or generated configuration changed since.
 
    Unlike the MDS switch, a failed OSD switch is **never rolled back**: an
    OSD that booted on the new release may have upgraded its store, and

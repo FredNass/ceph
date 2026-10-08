@@ -549,6 +549,17 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                  'staged switch.'
         ),
         Option(
+            'upgrade_staged_switch_stage_ahead',
+            type='bool',
+            default=True,
+            desc='With the staged switch, stage every daemon a policy can tell '
+                 'in advance it will switch (OSDs) once, at the start of its '
+                 'phase - hosts in parallel, while the daemons still serve - '
+                 'instead of group by group. A group then only re-stages the '
+                 'daemons whose generated configuration or target image changed '
+                 'since. Set to false to stage each group only when it is picked.'
+        ),
+        Option(
             'upgrade_staged_switch_osd_crush_level',
             type='str',
             default='host',
@@ -736,6 +747,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.upgrade_staged_switch_types = 'osd'
             self.upgrade_staged_switch_timeout = 120
             self.upgrade_staged_switch_max_parallel = 16
+            self.upgrade_staged_switch_stage_ahead = True
             self.upgrade_staged_switch_osd_crush_level = 'host'
             self.upgrade_staged_switch_osd_noout = True
             self.upgrade_staged_switch_osd_timeout = 600
